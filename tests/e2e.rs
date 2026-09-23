@@ -1,5 +1,6 @@
+use axum::body::Body;
 use axum::extract::State;
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Response};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use underclass::codex::CodexBackend;
@@ -26,7 +27,7 @@ async fn mock_responses(
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
     body: String,
-) -> impl IntoResponse {
+) -> Response {
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -40,7 +41,7 @@ async fn mock_responses(
             axum::http::StatusCode::UNAUTHORIZED,
             [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
             r#"{"error":{"message":"bad token"}}"#.to_string(),
-        );
+        ).into_response();
     }
 
     let failing = state.lock().unwrap().failing.contains(&bearer);
@@ -50,7 +51,7 @@ async fn mock_responses(
             axum::http::StatusCode::TOO_MANY_REQUESTS,
             [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
             r#"{"error":{"code":"usage_limit_reached","message":"usage limit reached"}}"#.to_string(),
-        );
+        ).into_response();
     }
 
     state.lock().unwrap().served_by.push_back(bearer.clone());
@@ -65,8 +66,26 @@ async fn mock_responses(
                 axum::http::StatusCode::BAD_REQUEST,
                 [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
                 r#"{"error":{"message":"stream_options.include_usage unsupported"}}"#.to_string(),
-            );
+            ).into_response();
         }
+    }
+    if serde_json::from_str::<serde_json::Value>(&body).ok()
+        .and_then(|value| value.get("slow_abort").and_then(|flag| flag.as_bool())) == Some(true) {
+        let stream = futures::stream::unfold(0, |step| async move {
+            match step {
+                0 => Some((Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n")), 1)),
+                1 => {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    Some((Ok(axum::body::Bytes::from_static(b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":3}}}\n\n")), 2))
+                }
+                _ => None,
+            }
+        });
+        return (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+            Body::from_stream(stream),
+        ).into_response();
     }
     let usage_event = if chat {
         "data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3}}\n\n"
@@ -81,14 +100,14 @@ async fn mock_responses(
             axum::http::StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "text/event-stream".to_string())],
             payload,
-        )
+        ).into_response()
     } else {
         (
             axum::http::StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
             if chat { format!(r#"{{"account":"{bearer}","usage":{{"prompt_tokens":11,"completion_tokens":3}}}}"#) }
             else { format!(r#"{{"account":"{bearer}","output_text":"hello from {bearer}","usage":{{"input_tokens":11,"output_tokens":3}}}}"#) },
-        )
+        ).into_response()
     }
 }
 
@@ -287,8 +306,17 @@ async fn e2e_full_pool_story() {
     assert_eq!(summary.status(), 200);
     let groups: serde_json::Value = summary.json().await.unwrap();
     assert!(groups["groups"].as_array().unwrap().iter().any(|g| g["account_id"] == "acc-2" && g["input_tokens"].as_i64().unwrap() >= 11));
+    let filtered = http.get(format!("{base}/admin/api/usage/requests?from_ms=0&to_ms={}&model=gpt-5.5&account_id=acc-2&cache_key=sess-a", now_ms() + 100_000))
+        .header("Authorization", "Bearer unused").send().await.unwrap();
+    assert_eq!(filtered.status(), 200);
+    let filtered_body: serde_json::Value = filtered.json().await.unwrap();
+    let filtered_rows = filtered_body["requests"].as_array().unwrap();
+    assert_eq!(filtered_rows.len(), 1);
+    assert_eq!(filtered_rows[0]["input_tokens"], 11);
     let forbidden = http.get(format!("{base}/admin/api/usage")).send().await.unwrap();
     assert_eq!(forbidden.status(), 401);
+    let forbidden_details = http.get(format!("{base}/admin/api/usage/requests")).send().await.unwrap();
+    assert_eq!(forbidden_details.status(), 401);
 
     // phase 4: both accounts exhausted -> fail fast with earliest reset
     mock.lock().unwrap().failing.insert("cop-acc-2".into());
@@ -387,6 +415,22 @@ async fn e2e_full_pool_story() {
     assert!(fallback_rows.iter().any(|r| r.status == 400 && r.input_tokens.is_none()));
     assert!(fallback_rows.iter().any(|r| r.status == 200 && r.input_tokens == Some(11)));
     mock.lock().unwrap().reject_stream_usage = false;
+
+    let aborted = http.post(format!("{base2}/v1/responses"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"model":"m","input":"hi","stream":true,"prompt_cache_key":"aborted-session","slow_abort":true}))
+        .send().await.unwrap();
+    assert_eq!(aborted.status(), 200);
+    drop(aborted);
+    let abort_rows = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let rows = store2.usage_records(&underclass::store::UsageQuery { cache_key: Some("aborted-session".into()), ..Default::default() }).unwrap();
+            if !rows.is_empty() { break rows; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("aborted stream was never recorded");
+    assert_eq!(abort_rows.len(), 1);
+    assert_eq!((abort_rows[0].input_tokens, abort_rows[0].output_tokens), (None, None));
 
     // phase 8: models endpoint + auth enforcement
     let models = http
