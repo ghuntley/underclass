@@ -1,6 +1,6 @@
 use crate::flows::{FlowRegistry, FlowState};
 use crate::jwt;
-use crate::models::{now_ms, Account};
+use crate::models::{now_ms, Account, Outcome};
 use crate::provider::Backend;
 use crate::store::Store;
 use http::HeaderMap;
@@ -246,6 +246,69 @@ impl Backend for CodexBackend {
         self.cooldown_ms
     }
 
+    /// @cc [owner:ghuntley,label:pool] codex-quota-deadline
+    /// A Codex usage-limit error MUST cool the account until the later valid future deadline from
+    /// `error.resets_at` (epoch seconds) and Retry-After. Without either, it MUST use the configured
+    /// cooldown. Overload errors MUST remain transient. Legacy plain-text quota indicators MUST
+    /// remain recognized by this backend.
+    fn classify(&self, status: u16, body: &str, headers: &HeaderMap, now_ms: i64) -> Outcome {
+        let error = serde_json::from_str::<Value>(body)
+            .ok()
+            .and_then(|v| v.get("error").cloned());
+        let error_type = error
+            .as_ref()
+            .and_then(|e| e.get("type"))
+            .and_then(Value::as_str);
+        let error_code = error
+            .as_ref()
+            .and_then(|e| e.get("code"))
+            .and_then(Value::as_str);
+        if error_type == Some("server_is_overloaded") || error_code == Some("server_is_overloaded")
+        {
+            return Outcome::Transient;
+        }
+        let legacy_quota = [
+            "usage_limit_reached",
+            "insufficient_quota",
+            "usage_not_included",
+            "FreeUsageLimitError",
+            "rate_limit",
+            "too_many_requests",
+        ];
+        let quota_body = error_type
+            .into_iter()
+            .chain(error_code)
+            .any(|v| legacy_quota.iter().any(|q| v.eq_ignore_ascii_case(q)))
+            || (error.is_none() && {
+                let lower = body.to_ascii_lowercase();
+                legacy_quota.iter().any(|q| lower.contains(&q.to_ascii_lowercase()))
+            });
+        if status == 429 || quota_body {
+            let body_deadline = if error_type == Some("usage_limit_reached")
+                || error_code == Some("usage_limit_reached")
+            {
+                error
+                    .as_ref()
+                    .and_then(|e| e.get("resets_at"))
+                    .and_then(Value::as_i64)
+                    .and_then(|seconds| seconds.checked_mul(1000))
+                    .filter(|deadline| *deadline > now_ms)
+            } else {
+                None
+            };
+            let header_deadline = crate::health::parse_retry_after_headers(headers, now_ms)
+                .filter(|deadline| *deadline > now_ms);
+            return Outcome::QuotaExhausted {
+                until_ms: body_deadline
+                    .into_iter()
+                    .chain(header_deadline)
+                    .max()
+                    .unwrap_or(now_ms.saturating_add(self.cooldown_ms)),
+            };
+        }
+        crate::health::classify(status, headers, self.cooldown_ms, now_ms)
+    }
+
     /// @cc [owner:ghuntley,label:proxy] codex-store-false
     /// Every outbound Codex request body MUST have `store` set to `false`; the upstream endpoint
     /// rejects requests otherwise.
@@ -322,6 +385,59 @@ pub fn default_catalog() -> Vec<crate::models::ModelInfo> {    let entries: &[(&
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_body_deadline_outlasts_short_header() {
+        let backend = CodexBackend {
+            cooldown_ms: 30_000,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", http::HeaderValue::from_static("10"));
+        let body = r#"{"error":{"type":"usage_limit_reached","resets_at":100}}"#;
+        assert!(matches!(
+            backend.classify(429, body, &headers, 1_000),
+            Outcome::QuotaExhausted { until_ms: 100_000 }
+        ));
+        assert!(matches!(
+            backend.classify(429, body, &headers, 200_000),
+            Outcome::QuotaExhausted { until_ms: 210_000 }
+        ));
+        headers.insert("retry-after", http::HeaderValue::from_static("200"));
+        assert!(matches!(
+            backend.classify(429, body, &headers, 1_000),
+            Outcome::QuotaExhausted { until_ms: 201_000 }
+        ));
+    }
+
+    #[test]
+    fn overload_is_transient_and_legacy_quota_remains_supported() {
+        let backend = CodexBackend {
+            cooldown_ms: 30_000,
+        };
+        let headers = HeaderMap::new();
+        assert!(matches!(
+            backend.classify(
+                429,
+                r#"{"error":{"type":"server_is_overloaded"}}"#,
+                &headers,
+                1_000
+            ),
+            Outcome::Transient
+        ));
+        assert!(matches!(
+            backend.classify(
+                400,
+                r#"{"error":{"code":"usage_not_included"}}"#,
+                &headers,
+                1_000
+            ),
+            Outcome::QuotaExhausted { until_ms: 31_000 }
+        ));
+        assert!(matches!(
+            backend.classify(400, "FreeUsageLimitError oops", &headers, 1_000),
+            Outcome::QuotaExhausted { until_ms: 31_000 }
+        ));
+    }
 
     #[test]
     fn rewrites_completion_paths_to_codex_endpoint() {

@@ -3,7 +3,7 @@ use hegel::TestCase;
 use underclass::models::{Account, AccountStatus, BackendId, Outcome};
 use underclass::pool::{PoolCore, SelectError};
 use underclass::store::{Store, UsageQuery, UsageRecord};
-use underclass::resets::{Candidate, RateLimit, Window, choose_candidate, natural_recovery_ms};
+use underclass::resets::{Candidate, RateLimit, Window, blocked_cooling_deadline, choose_candidate, natural_recovery_ms};
 use underclass::usage::{TokenCounts, UsageTap};
 use std::collections::HashMap;
 
@@ -148,6 +148,22 @@ fn test_recovery_is_latest_exhausted_window(tc: TestCase) {
     let expected = [primary_exhausted.then_some(primary * 1000), secondary_exhausted.then_some(secondary * 1000)]
         .into_iter().flatten().max();
     assert_eq!(natural_recovery_ms(&limit, 0), expected);
+}
+
+#[hegel::test]
+fn test_blocked_usage_never_shortens_cooling(tc: TestCase) {
+    let current: i64 = tc.draw(gs::integers::<i64>().min_value(1).max_value(1_000_000));
+    let recovery: i64 = tc.draw(gs::integers::<i64>().min_value(1).max_value(1_000_000));
+    let result = blocked_cooling_deadline(AccountStatus::Cooling, current, recovery);
+    assert!(result.is_none_or(|deadline| deadline >= current && deadline == recovery));
+    assert_eq!(
+        blocked_cooling_deadline(AccountStatus::Disabled, current, recovery),
+        None
+    );
+    assert_eq!(
+        blocked_cooling_deadline(AccountStatus::AuthError, current, recovery),
+        None
+    );
 }
 
 fn account(id: &str, backend: BackendId) -> Account {

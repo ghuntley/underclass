@@ -97,6 +97,17 @@ pub fn natural_recovery_ms(rate_limit: &RateLimit, now: i64) -> Option<i64> {
     .max()
 }
 
+/// @cc [owner:ghuntley,label:pool] monotonic-cooling-deadline
+/// Verified blocked usage MAY move a healthy account to cooling or extend an existing cooling
+/// deadline. It MUST NOT shorten a cooling deadline or alter AuthError and Disabled accounts.
+pub fn blocked_cooling_deadline(status: AccountStatus, current: i64, recovery: i64) -> Option<i64> {
+    match status {
+        AccountStatus::Healthy => Some(recovery),
+        AccountStatus::Cooling if recovery > current => Some(recovery),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub account_id: String,
@@ -139,6 +150,24 @@ fn set_status_if(
     core.set_status(account_id, next, reset_at);
     store.update_account_status(account_id, next, reset_at);
     true
+}
+
+fn cool_until_if_later(
+    pool: &Arc<Mutex<PoolCore>>,
+    store: &Store,
+    account_id: &str,
+    recovery: i64,
+) {
+    let mut core = pool.lock().unwrap();
+    let Some(account) = core.account(account_id) else {
+        return;
+    };
+    let Some(deadline) = blocked_cooling_deadline(account.status, account.reset_at, recovery)
+    else {
+        return;
+    };
+    core.set_status(account_id, AccountStatus::Cooling, deadline);
+    store.update_account_status(account_id, AccountStatus::Cooling, deadline);
 }
 
 pub struct ResetManager {
@@ -189,17 +218,8 @@ impl ResetManager {
                             AccountStatus::Healthy,
                             0,
                         );
-                    } else {
-                        if let Some(recovery) = natural_recovery_ms(limit, now_ms()) {
-                            set_status_if(
-                                pool,
-                                store,
-                                &account.id,
-                                AccountStatus::Healthy,
-                                AccountStatus::Cooling,
-                                recovery,
-                            );
-                        }
+                    } else if let Some(recovery) = natural_recovery_ms(limit, now_ms()) {
+                        cool_until_if_later(pool, store, &account.id, recovery);
                     }
                 }
                 if usage.available_resets > 0
@@ -667,6 +687,44 @@ mod tests {
             axum::http::StatusCode::OK,
             Json(serde_json::json!({"code": "reset", "windows_reset": 2})),
         )
+    }
+
+    #[tokio::test]
+    async fn usage_poll_extends_persisted_cooldown_and_readmits_when_allowed() {
+        let mock = Arc::new(MockState::default());
+        let app = Router::new()
+            .route("/wham/usage", get(usage))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let store = Arc::new(Store::in_memory().unwrap());
+        let mut account = crate::flows::new_account(BackendId::Codex, "owner@example.test".into());
+        account.access_token = Some("test-token".into());
+        account.expires_at = i64::MAX;
+        account.account_id = Some("chatgpt-account".into());
+        account.status = AccountStatus::Cooling;
+        account.reset_at = now_ms() + 60_000;
+        store.upsert_account(&account);
+        let pool = Arc::new(Mutex::new(PoolCore::new(&store)));
+        let client = reqwest::Client::new();
+        let tokens = TokenManager::new(store.clone(), client.clone());
+        let manager = ResetManager::new(client, base, true);
+        manager.poll_account(&account, &tokens, &pool, &store).await;
+        let extended = pool.lock().unwrap().account(&account.id).unwrap().reset_at;
+        assert!(extended > now_ms() + 5 * 86_400_000);
+        assert_eq!(store.get_account(&account.id).unwrap().reset_at, extended);
+        mock.allowed.store(true, Ordering::SeqCst);
+        manager.poll_account(&account, &tokens, &pool, &store).await;
+        assert_eq!(
+            pool.lock().unwrap().account(&account.id).unwrap().status,
+            AccountStatus::Healthy
+        );
+        assert_eq!(
+            store.get_account(&account.id).unwrap().status,
+            AccountStatus::Healthy
+        );
+        server.abort();
     }
 
     #[tokio::test]
