@@ -145,7 +145,15 @@ Install it into your profile:
 
 ```sh
 nix profile install github:ghuntley/underclass
+utop
 ```
+
+The installed package puts both `underclass` and `utop` on your PATH. `utop` runs
+`underclass top` and accepts the same `--url` option. You can also run it without
+installing with `nix run github:ghuntley/underclass#utop`. Enabling the NixOS
+service with its default package also adds both commands to the host PATH. For a
+service with a separate state directory, set `UNDERCLASS_UI_TOKEN` when running
+`utop`.
 
 Use the devenv shell (Rust toolchain, cargo) for development:
 

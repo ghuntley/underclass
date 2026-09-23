@@ -96,6 +96,8 @@ in
   };
 
   config = mkIf cfg.enable {
+    environment.systemPackages = [ cfg.package ];
+
     assertions = [
       {
         assertion = bindMatch != null && port > 0 && port <= 65535;

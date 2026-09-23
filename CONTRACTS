@@ -18,3 +18,6 @@ Pool routing, health classification, and stickiness MUST NOT special-case any ba
 
 @cc [owner:ghuntley,label:proxy] outbound-credential-stripping
 Outbound upstream requests MUST carry only proxy-injected credentials (the selected account's token); client-supplied authorization headers MUST NOT be forwarded upstream.
+
+@cc [owner:ghuntley,label:cli] nix-monitor-command
+The flake's underclass package MUST put `underclass` and `utop` in `bin`; `utop` MUST invoke `underclass top` with all user arguments preserved.

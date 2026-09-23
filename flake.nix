@@ -49,6 +49,10 @@
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             doCheck = false;
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            postInstall = ''
+              makeWrapper "$out/bin/underclass" "$out/bin/utop" --add-flags top
+            '';
 
             meta = with pkgs.lib; {
               description = "Pooled multi-subscription ChatGPT/Codex and GitHub Copilot proxy with an OpenAI-compatible endpoint";
@@ -65,6 +69,10 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.underclass}/bin/underclass";
+        };
+        utop = {
+          type = "app";
+          program = "${self.packages.${system}.underclass}/bin/utop";
         };
       });
 

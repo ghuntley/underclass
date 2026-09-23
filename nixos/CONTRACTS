@@ -3,3 +3,6 @@ The NixOS module MUST accept service secrets through a runtime environment-file 
 
 @cc [owner:ghuntley,label:testing] service-machine-test
 The NixOS machine test MUST boot the service, verify authenticated and unauthenticated HTTP behavior, verify durable state, and verify service restart behavior.
+
+@cc [owner:ghuntley,label:cli] service-cli-on-path
+Enabling `services.underclass` MUST add its configured package to the host's system packages. With the default package, this exposes `underclass` and `utop` on PATH.
