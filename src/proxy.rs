@@ -29,6 +29,7 @@ pub struct AppState {
     pub flows: crate::flows::FlowRegistry,
     pub proxy_key: Option<String>,
     pub ui_token: String,
+    pub resets: Arc<crate::resets::ResetManager>,
 }
 
 pub fn extract_sticky_key(body: &Value, session_header: Option<&str>) -> Option<String> {
@@ -136,9 +137,9 @@ enum Attempt {
 }
 
 /// @cc [owner:ghuntley,label:proxy] saturation-fail-fast-429
-/// When selection returns `Saturated`, `infer` MUST respond immediately with 429 and a
-/// `Retry-After` header equal to the seconds until the saturated `until_ms` deadline; it MUST
-/// NOT retry the request at that time.
+/// When selection returns `Saturated`, `infer` MUST first make one automatic Codex reset attempt
+/// for a live Codex-pool outage, then select again. If no account recovers, it MUST respond with
+/// 429 and `Retry-After` equal to the seconds until `until_ms`.
 pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let started = Instant::now();
     let request_id = req
@@ -189,16 +190,29 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
         .to_string();
     let sticky = extract_sticky_key(&body, session_header.as_deref());
 
+    state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await;
+
     let total_accounts = state.pool.lock().unwrap().accounts.len().max(1);
     let mut last_upstream: Option<Response> = None;
     let mut refreshed: std::collections::HashSet<String> = Default::default();
+    let mut reset_after_quota = false;
+    let mut attempts = 0;
+    let mut max_attempts = total_accounts;
 
-    for _attempt in 0..total_accounts {
-        let selection = state
+    while attempts < max_attempts {
+        attempts += 1;
+        let mut selection = state
             .pool
             .lock()
             .unwrap()
             .select(now_ms(), sticky.as_deref(), &model);
+
+        if matches!(selection, Err(SelectError::Saturated { .. })) && !reset_after_quota {
+            reset_after_quota = true;
+            if state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await {
+                selection = state.pool.lock().unwrap().select(now_ms(), sticky.as_deref(), &model);
+            }
+        }
 
         let selection = match selection {
             Ok(sel) => sel,
@@ -260,8 +274,19 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
             }
             Attempt::Failover(passthrough) => {
                 last_upstream = passthrough.or(last_upstream);
+                if attempts == max_attempts && !reset_after_quota {
+                    reset_after_quota = true;
+                    if state.resets.maybe_reset(&state.pool, &state.store, &state.tokens, &request_id).await {
+                        max_attempts += 1;
+                    }
+                }
             }
         }
+    }
+
+    if let Err(SelectError::Saturated { until_ms }) = state.pool.lock().unwrap().select(now_ms(), sticky.as_deref(), &model) {
+        logging::log_saturated(&request_id, until_ms);
+        return attach_request_id(saturated_response(until_ms), &request_id);
     }
 
     attach_request_id(
@@ -277,8 +302,9 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
 }
 
 /// @cc [owner:ghuntley,label:proxy] failover-bounded-by-accounts
-/// Each configured account MUST be attempted at most once per request, and the first successful
-/// upstream response MUST be returned to the client; upstream error bodies MUST be preserved and
+/// A request MUST make at most as many attempts as configured accounts, plus one additional attempt
+/// after a successful banked reset, and the first successful upstream response MUST be returned
+/// to the client; upstream error bodies MUST be preserved and
 /// returned when every attempt fails (or a 503 `pool_exhausted` error when no upstream response
 /// was ever received). A 401 MUST trigger exactly one forced token refresh and one same-account
 /// retry per request; a second 401 (or a failed refresh) MUST classify the account `AuthFailed`

@@ -147,6 +147,9 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
         flows: FlowRegistry::default(),
         proxy_key: Some("test-key".to_string()),
         ui_token: "unused".to_string(),
+        resets: Arc::new(underclass::resets::ResetManager::new(
+            reqwest::Client::new(), "http://127.0.0.1:1".to_string(), false,
+        )),
     });
 
     let v1 = axum::Router::new()

@@ -126,6 +126,12 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         flows: flows::FlowRegistry::default(),
         proxy_key,
         ui_token: ui_token.clone(),
+        resets: Arc::new(underclass::resets::ResetManager::new(
+            client.clone(),
+            std::env::var("UNDERCLASS_CODEX_USAGE_BASE")
+                .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
+            cfg.auto_codex_resets,
+        )),
     });
 
     {
@@ -146,6 +152,17 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
 
     refresh_copilot_catalogs_on_boot(&state).await;
     refresh_identities_on_boot(&state).await;
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                for account in state.store.list_accounts() {
+                    state.resets.poll_account(&account, &state.tokens, &state.pool, &state.store).await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            }
+        });
+    }
 
     let bind_addr = bind_override.unwrap_or(cfg.bind);
     let v1 = axum::Router::new()

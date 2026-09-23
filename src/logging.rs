@@ -73,6 +73,36 @@ pub fn log_saturated(request_id: &str, retry_after_ms: i64) {
     );
 }
 
+pub fn log_reset_decision(request_id: &str, reason: &str, cooling_accounts: usize, selected_wait_ms: Option<i64>) {
+    tracing::info!(
+        request_id = %request_id,
+        reason = %reason,
+        cooling_accounts,
+        selected_wait_ms,
+        "codex.reset.decision"
+    );
+}
+
+pub fn log_reset_account(request_id: &str, account_id: &str, label: &str, outcome: &str, natural_wait_ms: i64) {
+    tracing::info!(
+        request_id = %request_id,
+        account = %label,
+        account_id = %truncate(account_id),
+        outcome = %outcome,
+        natural_wait_ms,
+        "codex.reset.account"
+    );
+}
+
+pub fn log_reset_fetch(account_id: &str, label: &str, reason: &str) {
+    tracing::warn!(
+        account = %label,
+        account_id = %truncate(account_id),
+        reason = %reason,
+        "codex.reset.usage_unavailable"
+    );
+}
+
 fn truncate(id: &str) -> String {
     if id.len() <= 8 {
         id.to_string()

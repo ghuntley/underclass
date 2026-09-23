@@ -10,6 +10,7 @@ pub struct FileConfig {
     pub copilot_cooldown_secs: Option<u64>,
     pub copilot_cooldown_ms: Option<u64>,
     pub codex_cooldown_ms: Option<u64>,
+    pub auto_codex_resets: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -18,6 +19,7 @@ pub struct Config {
     pub proxy_key: Option<String>,
     pub ui_token: Option<String>,
     pub codex_cooldown_ms: i64,
+    pub auto_codex_resets: bool,
     pub copilot_cooldown_ms: i64,
     pub data_dir: PathBuf,
     #[allow(dead_code)]
@@ -79,11 +81,18 @@ impl Config {
             .or(file_cfg.copilot_cooldown_secs.map(|s| s * 1000))
             .unwrap_or(DEFAULT_COOLDOWN_MS as u64) as i64;
 
+        let auto_codex_resets = std::env::var("UNDERCLASS_AUTO_CODEX_RESETS")
+            .ok()
+            .and_then(|value| value.parse::<bool>().ok())
+            .or(file_cfg.auto_codex_resets)
+            .unwrap_or(true);
+
         Self {
             bind,
             proxy_key,
             ui_token,
             codex_cooldown_ms,
+            auto_codex_resets,
             copilot_cooldown_ms,
             data_dir,
             config_dir,

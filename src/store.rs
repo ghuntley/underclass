@@ -43,6 +43,13 @@ fn schema() -> &'static str {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS reset_attempts (
+        account_id TEXT PRIMARY KEY,
+        credit_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending',
+        started_at INTEGER NOT NULL
+    );
     "#
 }
 
@@ -162,6 +169,47 @@ impl Store {
             .expect("delete account");
         conn.execute("DELETE FROM bindings WHERE account_id = ?1", params![id])
             .expect("delete bindings of account");
+        conn.execute("DELETE FROM reset_attempts WHERE account_id = ?1", params![id])
+            .expect("delete reset attempt of account");
+    }
+
+    /// @cc [owner:ghuntley,label:persistence] reset-attempt-idempotency
+    /// A pending reset MUST retain the same request and credit IDs until the upstream outcome is
+    /// known, so a retry after a transport failure or restart cannot consume a second credit.
+    pub fn reset_attempt(&self, account_id: &str) -> Option<(String, String, String)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT credit_id, request_id, state FROM reset_attempts WHERE account_id = ?1",
+            params![account_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .expect("query reset attempt")
+    }
+
+    pub fn save_reset_attempt(&self, account_id: &str, credit_id: &str, request_id: &str) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO reset_attempts (account_id, credit_id, request_id, started_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![account_id, credit_id, request_id, crate::models::now_ms()],
+        )
+        .expect("save reset attempt");
+    }
+
+    pub fn clear_reset_attempt(&self, account_id: &str) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM reset_attempts WHERE account_id = ?1", params![account_id])
+            .expect("clear reset attempt");
+    }
+
+    pub fn finish_reset_attempt(&self, account_id: &str) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE reset_attempts SET state = 'completed' WHERE account_id = ?1",
+            params![account_id],
+        )
+        .expect("finish reset attempt");
     }
 
     pub fn update_account_status(&self, id: &str, status: AccountStatus, reset_at: i64) {

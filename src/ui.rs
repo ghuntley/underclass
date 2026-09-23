@@ -62,6 +62,7 @@ fn account_view(state: &AppState, account: &crate::models::Account) -> serde_jso
         "account_id": account.account_id,
         "enterprise_url": account.enterprise_url,
         "created_at": account.created_at,
+        "usage": state.resets.snapshot(&account.id),
     })
 }
 

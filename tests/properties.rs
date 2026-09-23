@@ -1,8 +1,44 @@
 use hegel::generators as gs;
 use hegel::TestCase;
 use underclass::models::{Account, AccountStatus, BackendId, Outcome};
-use underclass::pool::{Decision, PoolCore, SelectError};
+use underclass::pool::{PoolCore, SelectError};
 use underclass::store::Store;
+use underclass::resets::{Candidate, RateLimit, Window, choose_candidate, natural_recovery_ms};
+
+#[hegel::test]
+fn test_reset_candidate_has_latest_natural_recovery(tc: TestCase) {
+    let waits: Vec<i64> = tc.draw(gs::vecs(gs::integers::<i64>().min_value(1).max_value(604_800_000)).min_size(1).max_size(20));
+    let expected = *waits.iter().max().unwrap();
+    let candidates = waits.into_iter().enumerate().map(|(i, recovery_ms)| Candidate {
+        account_id: format!("account-{i}"),
+        recovery_ms,
+        credit_id: format!("credit-{i}"),
+        credit_expiry_ms: None,
+    });
+    assert_eq!(choose_candidate(candidates).unwrap().recovery_ms, expected);
+}
+
+#[hegel::test]
+fn test_recovery_is_latest_exhausted_window(tc: TestCase) {
+    let primary: i64 = tc.draw(gs::integers::<i64>().min_value(1).max_value(500_000));
+    let secondary: i64 = tc.draw(gs::integers::<i64>().min_value(1).max_value(500_000));
+    let primary_exhausted = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) == 1;
+    let secondary_exhausted = tc.draw(gs::integers::<u8>().min_value(0).max_value(1)) == 1;
+    let make_window = |deadline: i64, exhausted: bool| Window {
+        used_percent: if exhausted { 100.0 } else { 40.0 },
+        reset_at: Some(deadline),
+        limit_window_seconds: None,
+    };
+    let limit = RateLimit {
+        allowed: Some(false),
+        limit_reached: Some(true),
+        primary_window: Some(make_window(primary, primary_exhausted)),
+        secondary_window: Some(make_window(secondary, secondary_exhausted)),
+    };
+    let expected = [primary_exhausted.then_some(primary * 1000), secondary_exhausted.then_some(secondary * 1000)]
+        .into_iter().flatten().max();
+    assert_eq!(natural_recovery_ms(&limit, 0), expected);
+}
 
 fn account(id: &str, backend: BackendId) -> Account {
     Account {
