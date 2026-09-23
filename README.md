@@ -81,7 +81,7 @@ Optional `~/.config/underclass/config.toml`:
 | `codex_cooldown_secs` | `1800` | cooling window when upstream omits `retry-after` |
 | `copilot_cooldown_secs` | `1800` | same, for Copilot |
 
-Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`. For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM` (default to the real endpoints).
+Environment overrides: `UNDERCLASS_BIND`, `UNDERCLASS_PROXY_KEY`, `UNDERCLASS_UI_TOKEN`, `UNDERCLASS_MONITOR_SOCKET` (local socket path). For testing against a mock upstream: `UNDERCLASS_CODEX_UPSTREAM`, `UNDERCLASS_COPILOT_UPSTREAM` (default to the real endpoints).
 
 State (credentials, sticky bindings, model catalog, minted keys) lives in `~/.local/share/underclass/pool.db`. Delete it to start fresh.
 
@@ -96,7 +96,7 @@ underclass connect [--base-url URL] [--api-key KEY] [--model MODEL]
 
 `connect` targets the global opencode config by default; `--project` writes `./.opencode/opencode.json` instead. `--dry-run` prints the merged documents without writing.
 
-Run `underclass top` in a second terminal while `underclass serve` is running for a continuously updating, read-only pool monitor. It shows live in-flight requests, a 60-minute attempt chart, current UTC month token accounting, account status and sticky sessions, Codex quota windows and banked resets, and recent outcomes. Account states and quota levels are color coded and also labeled in text. Press `q` to quit; use arrow keys, `j`/`k`, or Page Up/Down to scroll accounts. The dashboard reconnects if the server becomes unavailable. It reads the local admin token from `UNDERCLASS_UI_TOKEN`, config, or the existing database without modifying it. For another server, pass `--url` and set `UNDERCLASS_UI_TOKEN` in the environment. Copilot quota availability is shown as unknown because underclass has no Copilot quota snapshot. Counts are upstream attempts; token totals omit unknown usage.
+Run `underclass top` (or `utop` from the Nix package) in a second terminal while `underclass serve` is running for a continuously updating, read-only pool monitor. It shows live in-flight requests, a 60-minute attempt chart, current UTC month token accounting, account status and sticky sessions, Codex quota windows and banked resets, and recent outcomes. Account states and quota levels are color coded and also labeled in text. Press `q` to quit; use arrow keys, `j`/`k`, or Page Up/Down to scroll accounts. The dashboard reconnects if the server becomes unavailable. Locally it uses a Unix socket without a token; the NixOS service exposes `/run/underclass/monitor.sock` to local users. The socket serves only the monitor snapshot, which includes account labels and usage. If no socket is available, `top` can use the local admin token from `UNDERCLASS_UI_TOKEN`, config, or the existing database. For another server, pass `--url` and set `UNDERCLASS_UI_TOKEN` in the environment. The browser UI still requires its admin token. Copilot quota availability is shown as unknown because underclass has no Copilot quota snapshot. Counts are upstream attempts; token totals omit unknown usage.
 
 ## Endpoints
 
@@ -151,9 +151,8 @@ utop
 The installed package puts both `underclass` and `utop` on your PATH. `utop` runs
 `underclass top` and accepts the same `--url` option. You can also run it without
 installing with `nix run github:ghuntley/underclass#utop`. Enabling the NixOS
-service with its default package also adds both commands to the host PATH. For a
-service with a separate state directory, set `UNDERCLASS_UI_TOKEN` when running
-`utop`.
+service with its default package also adds both commands to the host PATH. `utop`
+connects to the service's local monitor socket without a token.
 
 Use the devenv shell (Rust toolchain, cargo) for development:
 

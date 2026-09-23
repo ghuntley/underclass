@@ -66,7 +66,7 @@ pub struct MonitorSnapshot {
 }
 
 /// @cc [owner:ghuntley,label:security] monitor-read-only-redacted
-/// The admin-gated monitor snapshot MUST perform no writes or upstream calls and MUST expose no
+/// The monitor snapshot MUST perform no writes or upstream calls and MUST expose no
 /// credentials, request bodies, prompt cache keys, or raw account IDs in recent request entries.
 pub async fn snapshot(State(state): State<Arc<AppState>>) -> Response {
     match collect(&state) {

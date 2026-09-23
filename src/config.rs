@@ -27,6 +27,7 @@ pub struct Config {
 }
 
 pub const DEFAULT_COOLDOWN_MS: i64 = 30 * 60 * 1000;
+pub const SYSTEM_MONITOR_SOCKET: &str = "/run/underclass/monitor.sock";
 
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -101,5 +102,15 @@ impl Config {
 
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("pool.db")
+    }
+
+    /// @cc [owner:ghuntley,label:cli] monitor-socket-location
+    /// The server MUST honor a nonempty `UNDERCLASS_MONITOR_SOCKET` and otherwise place its local
+    /// monitor socket beside the SQLite database.
+    pub fn monitor_socket_path(&self) -> PathBuf {
+        std::env::var_os("UNDERCLASS_MONITOR_SOCKET")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.data_dir.join("monitor.sock"))
     }
 }

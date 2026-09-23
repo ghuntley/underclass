@@ -116,6 +116,7 @@ in
       environment = {
         UNDERCLASS_DATA_DIR = "/var/lib/${cfg.stateDirectory}";
         UNDERCLASS_CONFIG_DIR = "${configDirectory}";
+        UNDERCLASS_MONITOR_SOCKET = "/run/underclass/monitor.sock";
       };
 
       serviceConfig = {
@@ -124,6 +125,8 @@ in
 
         DynamicUser = true;
         StateDirectory = cfg.stateDirectory;
+        RuntimeDirectory = "underclass";
+        RuntimeDirectoryMode = "0755";
         Restart = "on-failure";
         RestartSec = 5;
 
@@ -136,6 +139,7 @@ in
         ProtectKernelModules = true;
         ProtectControlGroups = true;
         RestrictAddressFamilies = [
+          "AF_UNIX"
           "AF_INET"
           "AF_INET6"
         ];

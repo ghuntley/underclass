@@ -6,3 +6,6 @@ The NixOS machine test MUST boot the service, verify authenticated and unauthent
 
 @cc [owner:ghuntley,label:cli] service-cli-on-path
 Enabling `services.underclass` MUST add its configured package to the host's system packages. With the default package, this exposes `underclass` and `utop` on PATH.
+
+@cc [owner:ghuntley,label:security] service-monitor-socket
+The service MUST create a Unix monitor socket at `/run/underclass/monitor.sock` that local users can connect to without a token; network admin endpoints MUST retain token authentication.

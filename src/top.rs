@@ -8,6 +8,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState, Wrap};
 use std::io::IsTerminal;
+use std::os::unix::fs::FileTypeExt;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -42,14 +44,30 @@ enum Update {
     Error(String),
 }
 
-/// @cc [owner:ghuntley,label:cli] top-observes-only
-/// `run` MUST obtain dashboard data only through authenticated GET requests, MUST leave the local
-/// SQLite database untouched, and MUST restore terminal state on every normal exit or error.
-pub fn run(url_override: Option<String>) -> Result<(), String> {
-    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
-        return Err("underclass top requires an interactive terminal".into());
+enum MonitorTarget {
+    Socket(PathBuf),
+    Http { url: String, token: String },
+}
+
+fn is_socket(path: &Path) -> bool {
+    path.symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_socket())
+}
+
+/// @cc [owner:ghuntley,label:security] top-local-before-token
+/// Without `--url`, `top` MUST prefer an available local monitor socket and send no admin token
+/// over it. With `--url`, it MUST use HTTP(S) and require an explicit environment token.
+fn monitor_target(config: &Config, url_override: Option<String>) -> Result<MonitorTarget, String> {
+    if url_override.is_none() {
+        let local_socket = config.monitor_socket_path();
+        if is_socket(&local_socket) {
+            return Ok(MonitorTarget::Socket(local_socket));
+        }
+        let system_socket = PathBuf::from(crate::config::SYSTEM_MONITOR_SOCKET);
+        if is_socket(&system_socket) {
+            return Ok(MonitorTarget::Socket(system_socket));
+        }
     }
-    let config = Config::load();
     let url = match url_override.as_deref() {
         Some(url) => url.trim_end_matches('/').to_string(),
         None => {
@@ -69,9 +87,7 @@ pub fn run(url_override: Option<String>) -> Result<(), String> {
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        return Err(
-            "server URL must be an HTTP(S) origin without credentials, path, or query".into(),
-        );
+        return Err("server URL must be an HTTP(S) origin without credentials, path, or query".into());
     }
     let token = if url_override.is_some() {
         std::env::var("UNDERCLASS_UI_TOKEN")
@@ -82,20 +98,45 @@ pub fn run(url_override: Option<String>) -> Result<(), String> {
             .ui_token
             .clone()
             .filter(|s| !s.is_empty())
-            .or_else(|| local_token(&config))
+            .or_else(|| local_token(config))
     }
-    .ok_or("admin token unavailable; start underclass serve or set UNDERCLASS_UI_TOKEN")?;
-    let client = reqwest::blocking::Client::builder()
+    .ok_or("monitor socket unavailable and admin token unavailable; start underclass serve or set UNDERCLASS_UI_TOKEN")?;
+    Ok(MonitorTarget::Http { url, token })
+}
+
+/// @cc [owner:ghuntley,label:cli] top-observes-only
+/// `run` MUST obtain dashboard data only through GET requests to the local monitor socket or
+/// authenticated HTTP, MUST leave the local SQLite database untouched, and MUST restore terminal
+/// state on every normal exit or error.
+pub fn run(url_override: Option<String>) -> Result<(), String> {
+    if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+        return Err("underclass top requires an interactive terminal".into());
+    }
+    let config = Config::load();
+    let target = monitor_target(&config, url_override)?;
+    let mut client_builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(2))
-        .redirect(reqwest::redirect::Policy::none())
+        .redirect(reqwest::redirect::Policy::none());
+    if let MonitorTarget::Socket(path) = &target {
+        client_builder = client_builder.unix_socket(path.clone());
+    }
+    let client = client_builder
         .build()
         .map_err(|e| format!("HTTP client: {e}"))?;
     let (tx, rx) = mpsc::channel();
-    let worker_url = format!("{url}/admin/api/monitor");
+    let worker_url = match &target {
+        MonitorTarget::Socket(_) => "http://localhost/monitor".to_string(),
+        MonitorTarget::Http { url, .. } => format!("{url}/admin/api/monitor"),
+    };
     let worker = std::thread::spawn(move || {
         loop {
             let started = Instant::now();
-            let update = match client.get(&worker_url).bearer_auth(&token).send() {
+            let request = client.get(&worker_url);
+            let request = match &target {
+                MonitorTarget::Socket(_) => request,
+                MonitorTarget::Http { token, .. } => request.bearer_auth(token),
+            };
+            let update = match request.send() {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<MonitorSnapshot>() {
                         Ok(snapshot) => Update::Snapshot(snapshot),

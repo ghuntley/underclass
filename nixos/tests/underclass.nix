@@ -38,10 +38,18 @@ pkgs.testers.nixosTest {
 
     with subtest("admin endpoints require the UI token"):
         machine.fail("curl -sf -o /dev/null http://127.0.0.1:8080/admin/api/state")
+        machine.fail("curl -sf -o /dev/null http://127.0.0.1:8080/admin/api/monitor")
         machine.succeed(
             "curl -sf -H 'Authorization: Bearer test-ui-token' "
             "http://127.0.0.1:8080/admin/api/state | grep -q accounts"
         )
+
+    with subtest("local monitor socket needs no token and exposes no admin controls"):
+        machine.succeed("test -S /run/underclass/monitor.sock")
+        machine.succeed("test $(stat -c %a /run/underclass) = 755")
+        machine.succeed("test $(stat -c %a /run/underclass/monitor.sock) = 666")
+        machine.succeed("curl --unix-socket /run/underclass/monitor.sock -sf http://localhost/monitor | grep -q minute_bins")
+        machine.fail("curl --unix-socket /run/underclass/monitor.sock -sf -o /dev/null http://localhost/admin/api/state")
 
     with subtest("v1 models serves the union catalog with the proxy key"):
         machine.succeed(

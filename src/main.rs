@@ -4,6 +4,8 @@ use underclass::{cli, codex, config, copilot, flows, logging, models, monitor, p
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(name = "underclass", about = "pooled multi-subscription codex/copilot proxy for opencode")]
@@ -178,7 +180,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         });
     }
 
-    let bind_addr = bind_override.unwrap_or(cfg.bind);
+    let bind_addr = bind_override.unwrap_or_else(|| cfg.bind.clone());
     let v1 = axum::Router::new()
         .route("/models", axum::routing::get(proxy::models))
         .route("/responses", axum::routing::post(proxy::infer))
@@ -187,6 +189,12 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
             state.clone(),
             proxy::require_proxy_key,
         ))
+        .with_state(state.clone());
+
+    // The local socket serves only the read-only monitor snapshot. Network admin routes
+    // retain their token middleware.
+    let local_app = axum::Router::new()
+        .route("/monitor", axum::routing::get(monitor::snapshot))
         .with_state(state.clone());
 
     let app = axum::Router::new()
@@ -231,10 +239,61 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+    let monitor_socket = bind_monitor_socket(&cfg.monitor_socket_path())?;
     println!("underclass listening on http://{bind_addr}");
     println!("web ui: http://{bind_addr}/");
-    axum::serve(listener, app).await?;
+    tokio::try_join!(axum::serve(listener, app), axum::serve(monitor_socket, local_app))?;
     Ok(())
+}
+
+/// @cc [owner:ghuntley,label:security] local-monitor-socket
+/// The local monitor socket MUST be a Unix socket with mode 0666 so local users can read its
+/// limited monitor endpoint. A stale socket MAY be replaced only when no server accepts it;
+/// non-socket paths and live sockets MUST remain untouched.
+fn bind_monitor_socket(path: &Path) -> std::io::Result<tokio::net::UnixListener> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let listener = match tokio::net::UnixListener::bind(path) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            let metadata = path.symlink_metadata()?;
+            if !metadata.file_type().is_socket() {
+                return Err(error);
+            }
+            match std::os::unix::net::UnixStream::connect(path) {
+                Err(connect_error) if connect_error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(path)?;
+                    tokio::net::UnixListener::bind(path)?
+                }
+                _ => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+    Ok(listener)
+}
+
+#[cfg(test)]
+mod monitor_socket_tests {
+    use super::bind_monitor_socket;
+
+    #[tokio::test]
+    async fn keeps_live_socket_and_recovers_stale_socket() {
+        let dir = std::env::temp_dir().join(format!("underclass-monitor-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("monitor.sock");
+        let first = bind_monitor_socket(&path).unwrap();
+        assert!(bind_monitor_socket(&path).is_err());
+        drop(first);
+        let second = bind_monitor_socket(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o666);
+        drop(second);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    use std::os::unix::fs::PermissionsExt;
 }
 
 fn seed_catalog(store: &store::Store, backend: models::BackendId, defaults: Vec<models::ModelInfo>) {
