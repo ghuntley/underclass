@@ -209,6 +209,7 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
         .with_state(state.clone());
 
     let admin = axum::Router::new()
+        .route("/admin/api/monitor", axum::routing::get(underclass::monitor::snapshot))
         .route("/admin/api/usage", axum::routing::get(underclass::ui::usage_summary))
         .route("/admin/api/usage/requests", axum::routing::get(underclass::ui::usage_requests))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), underclass::ui::require_ui_token));
@@ -273,6 +274,19 @@ async fn e2e_full_pool_story() {
     let body2 = r2.text().await.unwrap();
     assert!(body2.contains("hello from tok-acc-1"), "sticky session moved accounts: {body2}");
     let rows = store.usage_records(&underclass::store::UsageQuery { cache_key: Some("sess-a".into()), ..Default::default() }).unwrap();
+    let denied = http.get(format!("{base}/admin/api/monitor")).send().await.unwrap();
+    assert_eq!(denied.status(), 401);
+    let monitor = http.get(format!("{base}/admin/api/monitor"))
+        .bearer_auth("unused").send().await.unwrap();
+    assert_eq!(monitor.status(), 200);
+    let monitor_text = monitor.text().await.unwrap();
+    assert!(!monitor_text.contains("sess-a"));
+    assert!(!monitor_text.contains("tok-acc-1"));
+    assert!(!monitor_text.contains("refresh-acc-1"));
+    let monitor: serde_json::Value = serde_json::from_str(&monitor_text).unwrap();
+    assert_eq!(monitor["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(monitor["month"]["attempts"], 2);
+    assert_eq!(monitor["minute_bins"].as_array().unwrap().len(), 60);
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| r.input_tokens == Some(11) && r.output_tokens == Some(3) && r.account_id == "acc-1"));
 

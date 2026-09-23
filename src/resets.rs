@@ -66,7 +66,7 @@ enum ConsumeCode {
     AlreadyRedeemed,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct UsageSnapshot {
     pub rate_limit: Option<RateLimit>,
     pub available_resets: i64,

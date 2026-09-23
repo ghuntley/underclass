@@ -135,6 +135,55 @@ fn schema() -> &'static str {
 }
 
 impl Store {
+    /// @cc [owner:ghuntley,label:accounting] monitor-bins-bounded
+    /// `monitor_minute_bins` MUST count only upstream attempts in the trailing 60 complete-or-
+    /// partial minute buckets and MUST return exactly 60 counts without exposing usage rows.
+    pub fn monitor_minute_bins(&self, now_ms: i64) -> rusqlite::Result<Vec<i64>> {
+        let current_minute = now_ms.div_euclid(60_000);
+        let first_minute = current_minute - 59;
+        let mut bins = vec![0; 60];
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT CASE WHEN ts >= 0 THEN ts / 60000 ELSE (ts - 59999) / 60000 END AS minute, COUNT(*) FROM usage_records \
+             WHERE ts >= ?1 AND ts <= ?2 GROUP BY minute",
+        )?;
+        let rows = stmt.query_map(params![first_minute * 60_000, now_ms], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (minute, count) = row?;
+            if let Ok(index) = usize::try_from(minute - first_minute)
+                && index < bins.len()
+            {
+                bins[index] = count;
+            }
+        }
+        Ok(bins)
+    }
+
+    /// @cc [owner:ghuntley,label:accounting] monitor-account-totals-complete
+    /// `monitor_account_totals` MUST include every upstream attempt in `[from_ms, to_ms)` for
+    /// every account without pagination, and MUST count missing token pairs as unknown.
+    pub fn monitor_account_totals(&self, from_ms: i64, to_ms: i64) -> rusqlite::Result<Vec<UsageSummary>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT account_id, MAX(account_label), COUNT(*), \
+             SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END), \
+             COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) \
+             FROM usage_records WHERE ts >= ?1 AND ts < ?2 GROUP BY account_id"
+        )?;
+        let rows = stmt.query_map(params![from_ms, to_ms], |r| {
+            let requests: i64 = r.get(2)?;
+            let unknown: i64 = r.get(3)?;
+            Ok(UsageSummary {
+                model: None, account_id: r.get(0)?, account_label: r.get(1)?, cache_key: None,
+                requests, measured_requests: requests - unknown, unknown_requests: unknown,
+                input_tokens: r.get(4)?, output_tokens: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     /// @cc [owner:ghuntley,label:persistence] usage-write-through
     /// Each upstream attempt MUST create one durable usage row, retaining its account label and
     /// unknown token counts as NULL even when the account is later removed.
@@ -492,6 +541,30 @@ fn parse_status(s: &str) -> AccountStatus {
 #[cfg(test)]
 mod tests {
     use super::{Store, UsageQuery, UsageRecord};
+
+    #[test]
+    fn monitor_buckets_and_account_totals_respect_bounds_and_unknowns() {
+        let store = Store::in_memory().unwrap();
+        for (ts, account, input, output) in [
+            (59_999, "a", Some(5), Some(2)),
+            (60_000, "a", Some(10), Some(4)),
+            (119_999, "a", None, None),
+            (120_000, "b", Some(3), Some(1)),
+        ] {
+            store.insert_usage(&UsageRecord {
+                id: 0, request_id: format!("request-{ts}"), ts, endpoint: "/v1/responses".into(),
+                backend: "codex".into(), model: "model".into(), account_id: account.into(),
+                account_label: account.into(), cache_key: Some("secret-session".into()),
+                status: 200, input_tokens: input, output_tokens: output,
+            }).unwrap();
+        }
+        let bins = store.monitor_minute_bins(120_000).unwrap();
+        assert_eq!(bins.len(), 60);
+        assert_eq!(&bins[57..], &[1, 2, 1]);
+        let totals = store.monitor_account_totals(60_000, 120_000).unwrap();
+        assert_eq!(totals.len(), 1);
+        assert_eq!((totals[0].requests, totals[0].unknown_requests, totals[0].input_tokens, totals[0].output_tokens), (2, 1, 10, 4));
+    }
 
     #[test]
     fn usage_survives_reopen_and_splits_unknown_from_measured() {

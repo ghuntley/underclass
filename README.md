@@ -89,11 +89,14 @@ State (credentials, sticky bindings, model catalog, minted keys) lives in `~/.lo
 
 ```
 underclass serve [--bind ADDR]
+underclass top [--url HTTP_OR_HTTPS_ORIGIN]
 underclass connect [--base-url URL] [--api-key KEY] [--model MODEL]
                    [--project] [--no-default-model] [--dry-run] [--remove]
 ```
 
 `connect` targets the global opencode config by default; `--project` writes `./.opencode/opencode.json` instead. `--dry-run` prints the merged documents without writing.
+
+Run `underclass top` in a second terminal while `underclass serve` is running for a continuously updating, read-only pool monitor. It shows live in-flight requests, a 60-minute attempt chart, current UTC month token accounting, account status and sticky sessions, Codex quota windows and banked resets, and recent outcomes. Account states and quota levels are color coded and also labeled in text. Press `q` to quit; use arrow keys, `j`/`k`, or Page Up/Down to scroll accounts. The dashboard reconnects if the server becomes unavailable. It reads the local admin token from `UNDERCLASS_UI_TOKEN`, config, or the existing database without modifying it. For another server, pass `--url` and set `UNDERCLASS_UI_TOKEN` in the environment. Copilot quota availability is shown as unknown because underclass has no Copilot quota snapshot. Counts are upstream attempts; token totals omit unknown usage.
 
 ## Endpoints
 
@@ -106,6 +109,7 @@ underclass connect [--base-url URL] [--api-key KEY] [--model MODEL]
 | `GET /admin/api/state` | admin token | accounts, catalog, last 200 requests |
 | `GET /admin/api/usage` | admin token | token totals grouped by `group_by=model,account_id,cache_key` (any subset) |
 | `GET /admin/api/usage/requests` | admin token | paginated per-attempt accounting rows |
+| `GET /admin/api/monitor` | admin token | compact read-only live monitor snapshot |
 | `POST /admin/api/flows` | admin token | start a device-flow onboarding |
 | `GET /admin/api/flows/{id}` | admin token | poll an onboarding flow |
 | `POST /admin/api/accounts/{id}/enable|disable|relogin` | admin token | account controls |

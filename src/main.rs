@@ -1,5 +1,5 @@
 use underclass::provider::BackendMap;
-use underclass::{cli, codex, config, copilot, flows, logging, models, pool, proxy, store, tokens, ui};
+use underclass::{cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, store, tokens, top, ui};
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
@@ -26,11 +26,18 @@ enum Command {
         #[clap(flatten)]
         args: cli::ConnectArgs,
     },
+    /// watch live pool activity in a read-only terminal dashboard
+    Top {
+        #[arg(long, help = "server URL (requires UNDERCLASS_UI_TOKEN)")]
+        url: Option<String>,
+    },
 }
 
 fn main() {
     let cli = Cli::parse();
-    logging::init(cli.log_format);
+    if !matches!(cli.command, Some(Command::Top { .. })) {
+        logging::init(cli.log_format);
+    }
     match cli.command {
         Some(Command::Connect { args }) => {
             let cfg = config::Config::load();
@@ -41,6 +48,12 @@ fn main() {
             }
         }
         Some(Command::Serve { bind }) => serve(bind).expect("server failed"),
+        Some(Command::Top { url }) => {
+            if let Err(e) = top::run(url) {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
         None => serve(None).expect("server failed"),
     }
 }
@@ -180,6 +193,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route("/admin/api/state", axum::routing::get(ui::state))
         .route("/admin/api/usage", axum::routing::get(ui::usage_summary))
         .route("/admin/api/usage/requests", axum::routing::get(ui::usage_requests))
+        .route("/admin/api/monitor", axum::routing::get(monitor::snapshot))
         .route("/admin/api/flows", axum::routing::post(ui::start_flow))
         .route("/admin/api/flows/{id}", axum::routing::get(ui::flow_status))
         .route(

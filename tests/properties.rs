@@ -5,6 +5,64 @@ use underclass::pool::{PoolCore, SelectError};
 use underclass::store::{Store, UsageQuery, UsageRecord};
 use underclass::resets::{Candidate, RateLimit, Window, choose_candidate, natural_recovery_ms};
 use underclass::usage::{TokenCounts, UsageTap};
+use std::collections::HashMap;
+
+#[hegel::test]
+fn test_monitor_minute_bins_partition_recent_attempts(tc: TestCase) {
+    let offsets: Vec<i64> = tc.draw(gs::vecs(gs::integers::<i64>().min_value(-3_800_000).max_value(60_000)).max_size(40));
+    let now: i64 = tc.draw(gs::integers::<i64>().min_value(-1_000_000).max_value(5_000_000));
+    let first_minute = now.div_euclid(60_000) - 59;
+    let mut expected = vec![0i64; 60];
+    let store = Store::in_memory().unwrap();
+    for (i, offset) in offsets.iter().enumerate() {
+        let ts = now + offset;
+        store.insert_usage(&UsageRecord {
+            id: 0, request_id: format!("monitor-{i}"), ts, endpoint: "/v1/responses".into(),
+            backend: "codex".into(), model: "model".into(), account_id: "account".into(),
+            account_label: "label".into(), cache_key: None, status: 200,
+            input_tokens: None, output_tokens: None,
+        }).unwrap();
+        let minute = ts.div_euclid(60_000);
+        if minute >= first_minute && ts <= now {
+            expected[(minute - first_minute) as usize] += 1;
+        }
+    }
+    assert_eq!(store.monitor_minute_bins(now).unwrap(), expected);
+}
+
+#[hegel::test]
+fn test_monitor_account_totals_partition_month_and_unknown_usage(tc: TestCase) {
+    let samples: Vec<(i64, u8, u8)> = tc.draw(gs::vecs(gs::tuples!(
+        gs::integers::<i64>().min_value(0).max_value(150_000),
+        gs::integers::<u8>().min_value(0).max_value(5),
+        gs::integers::<u8>().min_value(0).max_value(200)
+    )).max_size(40));
+    let store = Store::in_memory().unwrap();
+    let mut expected: HashMap<String, (i64, i64, i64, i64)> = HashMap::new();
+    for (i, (ts, account, amount)) in samples.iter().enumerate() {
+        let id = format!("account-{account}");
+        let known = amount % 3 != 0;
+        let input = known.then_some(*amount as i64);
+        let output = known.then_some((*amount / 2) as i64);
+        store.insert_usage(&UsageRecord {
+            id: 0, request_id: format!("monitor-{i}"), ts: *ts, endpoint: "/v1/responses".into(),
+            backend: "codex".into(), model: "model".into(), account_id: id.clone(),
+            account_label: id.clone(), cache_key: None, status: 200,
+            input_tokens: input, output_tokens: output,
+        }).unwrap();
+        if (1_000..100_000).contains(ts) {
+            let total = expected.entry(id).or_default();
+            total.0 += 1;
+            total.1 += i64::from(!known);
+            total.2 += input.unwrap_or(0);
+            total.3 += output.unwrap_or(0);
+        }
+    }
+    let actual: HashMap<String, (i64, i64, i64, i64)> = store.monitor_account_totals(1_000, 100_000)
+        .unwrap().into_iter().map(|row| (row.account_id.unwrap(),
+            (row.requests, row.unknown_requests, row.input_tokens, row.output_tokens))).collect();
+    assert_eq!(actual, expected);
+}
 
 #[hegel::test]
 fn test_usage_parser_independent_of_chunk_boundaries(tc: TestCase) {
