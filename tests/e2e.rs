@@ -17,11 +17,14 @@ struct MockState {
     failing: BTreeSet<String>,
     served_by: VecDeque<String>,
     fourtwonined: VecDeque<String>,
+    chat_usage_options: VecDeque<bool>,
+    reject_stream_usage: bool,
 }
 
 async fn mock_responses(
     State(state): State<Arc<Mutex<MockState>>>,
     headers: axum::http::HeaderMap,
+    uri: axum::http::Uri,
     body: String,
 ) -> impl IntoResponse {
     let bearer = headers
@@ -51,8 +54,27 @@ async fn mock_responses(
     }
 
     state.lock().unwrap().served_by.push_back(bearer.clone());
+    let chat = uri.path().ends_with("/chat/completions");
+    if chat {
+        let enabled = serde_json::from_str::<serde_json::Value>(&body).ok()
+            .and_then(|value| value.pointer("/stream_options/include_usage").and_then(|v| v.as_bool())) == Some(true);
+        let mut mock = state.lock().unwrap();
+        mock.chat_usage_options.push_back(enabled);
+        if enabled && mock.reject_stream_usage {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
+                r#"{"error":{"message":"stream_options.include_usage unsupported"}}"#.to_string(),
+            );
+        }
+    }
+    let usage_event = if chat {
+        "data: {\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":3}}\n\n"
+    } else {
+        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":3}}}\n\n"
+    };
     let payload = format!(
-        "data: {{\"type\":\"response.started\",\"account\":\"{bearer}\"}}\n\ndata: {{\"type\":\"output_text.delta\",\"delta\":\"hello from {bearer}\"}}\n\ndata: [DONE]\n\n"
+        "data: {{\"type\":\"response.started\",\"account\":\"{bearer}\"}}\n\ndata: {{\"type\":\"output_text.delta\",\"delta\":\"hello from {bearer}\"}}\n\n{usage_event}data: [DONE]\n\n"
     );
     if wants_stream {
         (
@@ -64,7 +86,8 @@ async fn mock_responses(
         (
             axum::http::StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
-            format!(r#"{{"account":"{bearer}","output_text":"hello from {bearer}"}}"#),
+            if chat { format!(r#"{{"account":"{bearer}","usage":{{"prompt_tokens":11,"completion_tokens":3}}}}"#) }
+            else { format!(r#"{{"account":"{bearer}","output_text":"hello from {bearer}","usage":{{"input_tokens":11,"output_tokens":3}}}}"#) },
         )
     }
 }
@@ -150,6 +173,7 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
         resets: Arc::new(underclass::resets::ResetManager::new(
             reqwest::Client::new(), "http://127.0.0.1:1".to_string(), false,
         )),
+        stream_usage_unsupported: Mutex::new(Default::default()),
     });
 
     let v1 = axum::Router::new()
@@ -165,7 +189,12 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
         ))
         .with_state(state.clone());
 
+    let admin = axum::Router::new()
+        .route("/admin/api/usage", axum::routing::get(underclass::ui::usage_summary))
+        .route("/admin/api/usage/requests", axum::routing::get(underclass::ui::usage_requests))
+        .route_layer(axum::middleware::from_fn_with_state(state.clone(), underclass::ui::require_ui_token));
     let app = axum::Router::new().nest("/v1", v1)
+        .merge(admin)
         .layer(axum::middleware::from_fn(underclass::correlation::middleware))
         .with_state(state);
 
@@ -224,6 +253,9 @@ async fn e2e_full_pool_story() {
     let r2 = post(Some("sess-a"), true).await;
     let body2 = r2.text().await.unwrap();
     assert!(body2.contains("hello from tok-acc-1"), "sticky session moved accounts: {body2}");
+    let rows = store.usage_records(&underclass::store::UsageQuery { cache_key: Some("sess-a".into()), ..Default::default() }).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.input_tokens == Some(11) && r.output_tokens == Some(3) && r.account_id == "acc-1"));
 
     // phase 2: an unsticky request is served by the pool
     let r3 = post(None, false).await;
@@ -245,6 +277,18 @@ async fn e2e_full_pool_story() {
     );
     assert!(logs.lock().unwrap().iter().filter(|entry| entry.request_id == failover_id).count() >= 2,
         "failed and successful attempts must share the correlation ID in request history");
+    let rows = store.usage_records(&underclass::store::UsageQuery { cache_key: Some("sess-a".into()), ..Default::default() }).unwrap();
+    assert_eq!(rows.iter().filter(|r| r.request_id == failover_id).count(), 2);
+    assert_eq!(rows.iter().find(|r| r.request_id == failover_id && r.account_id == "acc-1").unwrap().input_tokens, None);
+    assert_eq!(rows.iter().find(|r| r.request_id == failover_id && r.account_id == "acc-2").unwrap().input_tokens, Some(11));
+
+    let summary = http.get(format!("{base}/admin/api/usage?from_ms=0&group_by=account_id"))
+        .header("Authorization", "Bearer unused").send().await.unwrap();
+    assert_eq!(summary.status(), 200);
+    let groups: serde_json::Value = summary.json().await.unwrap();
+    assert!(groups["groups"].as_array().unwrap().iter().any(|g| g["account_id"] == "acc-2" && g["input_tokens"].as_i64().unwrap() >= 11));
+    let forbidden = http.get(format!("{base}/admin/api/usage")).send().await.unwrap();
+    assert_eq!(forbidden.status(), 401);
 
     // phase 4: both accounts exhausted -> fail fast with earliest reset
     mock.lock().unwrap().failing.insert("cop-acc-2".into());
@@ -312,6 +356,37 @@ async fn e2e_full_pool_story() {
     assert_eq!(acc1.status, AccountStatus::AuthError, "401 must mark auth_error");
     let acc2 = store2.get_account("acc-2").unwrap();
     assert_eq!(acc2.status, AccountStatus::Healthy);
+    let streamed_chat = http.post(format!("{base2}/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,"prompt_cache_key":"chat-session"}))
+        .send().await.unwrap();
+    assert_eq!(streamed_chat.status(), 200);
+    streamed_chat.text().await.unwrap();
+    assert_eq!(mock.lock().unwrap().chat_usage_options.back(), Some(&true));
+    let chat_rows = store2.usage_records(&underclass::store::UsageQuery { cache_key: Some("chat-session".into()), ..Default::default() }).unwrap();
+    assert_eq!(chat_rows.len(), 1);
+    assert_eq!((chat_rows[0].input_tokens, chat_rows[0].output_tokens), (Some(11), Some(3)));
+    mock.lock().unwrap().reject_stream_usage = true;
+    let fallback_chat = http.post(format!("{base2}/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,"prompt_cache_key":"chat-fallback"}))
+        .send().await.unwrap();
+    assert_eq!(fallback_chat.status(), 200);
+    fallback_chat.text().await.unwrap();
+    let after_fallback = http.post(format!("{base2}/v1/chat/completions"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,"prompt_cache_key":"chat-after-fallback"}))
+        .send().await.unwrap();
+    assert_eq!(after_fallback.status(), 200);
+    after_fallback.text().await.unwrap();
+    let options = mock.lock().unwrap().chat_usage_options.clone();
+    assert!(options.len() >= 4);
+    assert_eq!(options.iter().rev().take(3).copied().collect::<Vec<_>>(), vec![false, false, true]);
+    let fallback_rows = store2.usage_records(&underclass::store::UsageQuery { cache_key: Some("chat-fallback".into()), ..Default::default() }).unwrap();
+    assert_eq!(fallback_rows.len(), 2);
+    assert!(fallback_rows.iter().any(|r| r.status == 400 && r.input_tokens.is_none()));
+    assert!(fallback_rows.iter().any(|r| r.status == 200 && r.input_tokens == Some(11)));
+    mock.lock().unwrap().reject_stream_usage = false;
 
     // phase 8: models endpoint + auth enforcement
     let models = http
@@ -337,4 +412,8 @@ async fn e2e_full_pool_story() {
         .await
         .unwrap();
     assert_eq!(unauth.status(), 401, "missing proxy key must be rejected");
+
+    store.delete_account("acc-1");
+    let history = store.usage_records(&underclass::store::UsageQuery { account_id: Some("acc-1".into()), ..Default::default() }).unwrap();
+    assert!(!history.is_empty(), "account removal must retain token accounting history");
 }

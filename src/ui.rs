@@ -1,11 +1,13 @@
 use crate::models::{now_ms, AccountStatus, BackendId, RequestLogEntry};
 use crate::proxy::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
+use crate::store::UsageQuery;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+use chrono::Datelike;
 use std::sync::Arc;
 
 pub const UI_HTML: &str = include_str!("ui.html");
@@ -90,6 +92,49 @@ pub async fn state(State(state): State<Arc<AppState>>) -> Response {
         "now_ms": now_ms(),
     }))
     .into_response()
+}
+
+fn usage_query(mut query: UsageQuery) -> Result<UsageQuery, Response> {
+    if query.from_ms.is_none() && query.to_ms.is_none() {
+        let now = chrono::Utc::now();
+        let start = now.date_naive().with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+        query.from_ms = Some(start);
+    }
+    if query.from_ms.zip(query.to_ms).is_some_and(|(from, to)| from >= to) {
+        return Err((StatusCode::BAD_REQUEST, "from_ms must precede to_ms").into_response());
+    }
+    if query.group_by.as_deref().unwrap_or("").split(',').any(|part| !part.is_empty() && !matches!(part, "model" | "account_id" | "cache_key")) {
+        return Err((StatusCode::BAD_REQUEST, "invalid group_by").into_response());
+    }
+    if query.cache_key.is_some() && query.missing_key == Some(true) {
+        return Err((StatusCode::BAD_REQUEST, "cache_key conflicts with missing_key").into_response());
+    }
+    Ok(query)
+}
+
+/// @cc [owner:ghuntley,label:security] usage-admin-query
+/// Usage summaries MUST be available only under the admin token gate and MUST report unknown
+/// requests separately from measured input and output totals.
+pub async fn usage_summary(State(state): State<Arc<AppState>>, Query(query): Query<UsageQuery>) -> Response {
+    let query = match usage_query(query) { Ok(query) => query, Err(response) => return response };
+    match state.store.usage_summary(&query) {
+        Ok(groups) => {
+            let total_query = UsageQuery { group_by: None, ..query.clone() };
+            match state.store.usage_summary(&total_query) {
+                Ok(totals) => Json(json!({"groups": groups, "totals": totals.first(), "from_ms": query.from_ms, "to_ms": query.to_ms})).into_response(),
+                Err(error) => { tracing::error!(error = %error, "usage.query_failed"); (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response() }
+            }
+        },
+        Err(error) => { tracing::error!(error = %error, "usage.query_failed"); (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response() }
+    }
+}
+
+pub async fn usage_requests(State(state): State<Arc<AppState>>, Query(query): Query<UsageQuery>) -> Response {
+    let query = match usage_query(query) { Ok(query) => query, Err(response) => return response };
+    match state.store.usage_records(&query) {
+        Ok(requests) => Json(json!({"requests": requests, "from_ms": query.from_ms, "to_ms": query.to_ms})).into_response(),
+        Err(error) => { tracing::error!(error = %error, "usage.query_failed"); (StatusCode::INTERNAL_SERVER_ERROR, "usage query failed").into_response() }
+    }
 }
 
 #[derive(Deserialize)]

@@ -2,6 +2,71 @@ use crate::models::{Account, AccountStatus, BackendId, Binding, ModelInfo};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Mutex;
+use serde::Serialize;
+use rusqlite::types::Value;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageRecord {
+    pub id: i64,
+    pub request_id: String,
+    pub ts: i64,
+    pub endpoint: String,
+    pub backend: String,
+    pub model: String,
+    pub account_id: String,
+    pub account_label: String,
+    pub cache_key: Option<String>,
+    pub status: u16,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+pub struct UsageQuery {
+    pub from_ms: Option<i64>,
+    pub to_ms: Option<i64>,
+    pub model: Option<String>,
+    pub account_id: Option<String>,
+    pub cache_key: Option<String>,
+    pub missing_key: Option<bool>,
+    pub group_by: Option<String>,
+    pub limit: Option<usize>,
+    pub offset: Option<usize>,
+}
+
+impl UsageQuery {
+    fn where_sql(&self) -> (String, Vec<Value>) {
+        let mut predicates = vec!["1=1".to_string()];
+        let mut values = Vec::new();
+        for (column, value) in [
+            ("ts >=", self.from_ms.map(Value::Integer)),
+            ("ts <", self.to_ms.map(Value::Integer)),
+            ("model =", self.model.clone().map(Value::Text)),
+            ("account_id =", self.account_id.clone().map(Value::Text)),
+            ("cache_key =", self.cache_key.clone().map(Value::Text)),
+        ] {
+            if let Some(value) = value {
+                predicates.push(format!("{column} ?"));
+                values.push(value);
+            }
+        }
+        if self.missing_key == Some(true) { predicates.push("cache_key IS NULL".into()); }
+        (predicates.join(" AND "), values)
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UsageSummary {
+    pub model: Option<String>,
+    pub account_id: Option<String>,
+    pub account_label: Option<String>,
+    pub cache_key: Option<String>,
+    pub requests: i64,
+    pub measured_requests: i64,
+    pub unknown_requests: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
 
 pub struct Store {
     conn: Mutex<Connection>,
@@ -50,10 +115,72 @@ fn schema() -> &'static str {
         state TEXT NOT NULL DEFAULT 'pending',
         started_at INTEGER NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS usage_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_id TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        endpoint TEXT NOT NULL,
+        backend TEXT NOT NULL,
+        model TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        account_label TEXT NOT NULL,
+        cache_key TEXT,
+        status INTEGER NOT NULL,
+        input_tokens INTEGER,
+        output_tokens INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS usage_records_ts ON usage_records(ts, id);
+    CREATE INDEX IF NOT EXISTS usage_records_dims ON usage_records(model, account_id, cache_key, ts);
     "#
 }
 
 impl Store {
+    /// @cc [owner:ghuntley,label:persistence] usage-write-through
+    /// Each upstream attempt MUST create one durable usage row, retaining its account label and
+    /// unknown token counts as NULL even when the account is later removed.
+    pub fn insert_usage(&self, record: &UsageRecord) -> rusqlite::Result<()> {
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO usage_records (request_id,ts,endpoint,backend,model,account_id,account_label,cache_key,status,input_tokens,output_tokens) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![record.request_id, record.ts, record.endpoint, record.backend, record.model, record.account_id, record.account_label, record.cache_key, record.status, record.input_tokens, record.output_tokens],
+        )?;
+        Ok(())
+    }
+
+    pub fn usage_summary(&self, query: &UsageQuery) -> rusqlite::Result<Vec<UsageSummary>> {
+        let (filter, mut values) = query.where_sql();
+        let requested: Vec<&str> = query.group_by.as_deref().unwrap_or("").split(',').filter(|s| !s.is_empty()).collect();
+        let groups: Vec<&str> = ["model", "account_id", "cache_key"].into_iter().filter(|name| requested.contains(name)).collect();
+        let select_dim = |name: &str| if groups.contains(&name) { name.to_string() } else { format!("NULL AS {name}") };
+        let label = if groups.contains(&"account_id") { "MAX(account_label) AS account_label" } else { "NULL AS account_label" };
+        let group_sql = if groups.is_empty() { String::new() } else { format!(" GROUP BY {}", groups.join(",")) };
+        let pagination = if groups.is_empty() { String::new() } else {
+            values.push(Value::Integer(query.limit.unwrap_or(100).clamp(1, 1000) as i64));
+            values.push(Value::Integer(query.offset.unwrap_or(0).min(i64::MAX as usize) as i64));
+            " LIMIT ? OFFSET ?".to_string()
+        };
+        let sql = format!("SELECT {},{},{},{},COUNT(*),COALESCE(SUM(CASE WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL THEN 1 ELSE 0 END),0),COALESCE(SUM(CASE WHEN input_tokens IS NULL OR output_tokens IS NULL THEN 1 ELSE 0 END),0),COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens FROM usage_records WHERE {filter}{group_sql} ORDER BY input_tokens DESC,model,account_id,cache_key{pagination}", select_dim("model"), select_dim("account_id"), label, select_dim("cache_key"));
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| Ok(UsageSummary {
+            model: r.get(0)?, account_id: r.get(1)?, account_label: r.get(2)?, cache_key: r.get(3)?, requests: r.get(4)?, measured_requests: r.get(5)?, unknown_requests: r.get(6)?, input_tokens: r.get(7)?, output_tokens: r.get(8)?,
+        }))?;
+        rows.collect()
+    }
+
+    pub fn usage_records(&self, query: &UsageQuery) -> rusqlite::Result<Vec<UsageRecord>> {
+        let (filter, mut values) = query.where_sql();
+        let limit = query.limit.unwrap_or(100).clamp(1, 1000) as i64;
+        let offset = query.offset.unwrap_or(0).min(i64::MAX as usize) as i64;
+        values.push(Value::Integer(limit));
+        values.push(Value::Integer(offset));
+        let sql = format!("SELECT id,request_id,ts,endpoint,backend,model,account_id,account_label,cache_key,status,input_tokens,output_tokens FROM usage_records WHERE {filter} ORDER BY ts DESC,id DESC LIMIT ? OFFSET ?");
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| Ok(UsageRecord {
+            id: r.get(0)?, request_id: r.get(1)?, ts: r.get(2)?, endpoint: r.get(3)?, backend: r.get(4)?, model: r.get(5)?, account_id: r.get(6)?, account_label: r.get(7)?, cache_key: r.get(8)?, status: r.get(9)?, input_tokens: r.get(10)?, output_tokens: r.get(11)?,
+        }))?;
+        rows.collect()
+    }
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -364,6 +491,30 @@ fn parse_status(s: &str) -> AccountStatus {
 
 #[cfg(test)]
 mod tests {
+    use super::{Store, UsageQuery, UsageRecord};
+
+    #[test]
+    fn usage_survives_reopen_and_splits_unknown_from_measured() {
+        let path = std::env::temp_dir().join(format!("underclass-usage-{}.db", uuid::Uuid::new_v4()));
+        {
+            let store = Store::open(&path).unwrap();
+            for (key, input) in [(Some("session-a"), Some(12)), (Some("session-a"), None), (Some("session-b"), Some(5))] {
+                store.insert_usage(&UsageRecord {
+                    id: 0, request_id: uuid::Uuid::new_v4().to_string(), ts: 100, endpoint: "/v1/responses".into(), backend: "codex".into(), model: "model-a".into(), account_id: "account-a".into(), account_label: "alice".into(), cache_key: key.map(str::to_string), status: 200, input_tokens: input, output_tokens: input.map(|n| n / 2),
+                }).unwrap();
+            }
+        }
+        let store = Store::open(&path).unwrap();
+        let query = UsageQuery { from_ms: Some(0), group_by: Some("model,account_id,cache_key".into()), cache_key: Some("session-a".into()), ..Default::default() };
+        let group = &store.usage_summary(&query).unwrap()[0];
+        assert_eq!((group.requests, group.measured_requests, group.unknown_requests, group.input_tokens, group.output_tokens), (2, 1, 1, 12, 6));
+        assert_eq!(group.account_label.as_deref(), Some("alice"));
+        assert_eq!(store.usage_records(&query).unwrap().len(), 2);
+        let page = store.usage_summary(&UsageQuery { from_ms: Some(0), group_by: Some("cache_key".into()), limit: Some(1), offset: Some(1), ..Default::default() }).unwrap();
+        assert_eq!(page.len(), 1);
+        drop(store);
+        std::fs::remove_file(path).unwrap();
+    }
     use super::*;
 
     fn binding(key: &str, bound_at: i64) -> Binding {

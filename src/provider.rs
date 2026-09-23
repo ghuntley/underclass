@@ -20,6 +20,10 @@ pub trait Backend: Send + Sync {
 
     fn prepare_body(&self, _body: &mut Value) {}
 
+    fn auto_stream_usage(&self, _path: &str, _body: &mut Value) -> bool { false }
+
+    fn usage_is_chat(&self, path: &str) -> bool { path.ends_with("/chat/completions") }
+
     fn classify(&self, status: u16, body: &str, headers: &HeaderMap, now_ms: i64) -> Outcome {
         crate::health::classify(self.id(), status, body, headers, self.default_cooldown_ms(), now_ms)
     }

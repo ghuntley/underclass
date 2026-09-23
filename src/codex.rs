@@ -237,6 +237,7 @@ pub struct CodexBackend {
 }
 
 impl Backend for CodexBackend {
+    fn usage_is_chat(&self, _path: &str) -> bool { false }
     fn id(&self) -> crate::models::BackendId {
         crate::models::BackendId::Codex
     }

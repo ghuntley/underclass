@@ -2,8 +2,60 @@ use hegel::generators as gs;
 use hegel::TestCase;
 use underclass::models::{Account, AccountStatus, BackendId, Outcome};
 use underclass::pool::{PoolCore, SelectError};
-use underclass::store::Store;
+use underclass::store::{Store, UsageQuery, UsageRecord};
 use underclass::resets::{Candidate, RateLimit, Window, choose_candidate, natural_recovery_ms};
+use underclass::usage::{TokenCounts, UsageTap};
+
+#[hegel::test]
+fn test_usage_parser_independent_of_chunk_boundaries(tc: TestCase) {
+    let input: i64 = tc.draw(gs::integers::<i64>().min_value(0).max_value(1_000_000));
+    let output: i64 = tc.draw(gs::integers::<i64>().min_value(0).max_value(1_000_000));
+    let splits: Vec<usize> = tc.draw(gs::vecs(gs::integers::<usize>().min_value(1).max_value(40)).max_size(30));
+    let event = format!("event: response.completed\r\ndata: {{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"input_tokens\":{input},\"output_tokens\":{output}}}}}}}\r\n\r\n");
+    let mut tap = UsageTap::new(true, false);
+    let mut position = 0;
+    for size in splits {
+        if position >= event.len() { break; }
+        let end = (position + size).min(event.len());
+        tap.feed(&event.as_bytes()[position..end]);
+        position = end;
+    }
+    tap.feed(&event.as_bytes()[position..]);
+    assert_eq!(tap.counts(), Some(TokenCounts { input_tokens: input, output_tokens: output }));
+}
+
+#[hegel::test]
+fn test_unknown_usage_never_becomes_zero(tc: TestCase) {
+    let input: i64 = tc.draw(gs::integers::<i64>().min_value(-1_000_000).max_value(-1));
+    let body = format!("{{\"usage\":{{\"input_tokens\":{input},\"output_tokens\":0}}}}");
+    let mut tap = UsageTap::new(false, false);
+    tap.feed(body.as_bytes());
+    assert_eq!(tap.counts(), None);
+}
+
+#[hegel::test]
+fn test_usage_groups_partition_measured_and_unknown_attempts(tc: TestCase) {
+    let samples: Vec<u8> = tc.draw(gs::vecs(gs::integers::<u8>().min_value(0).max_value(200)).max_size(20));
+    let store = Store::in_memory().unwrap();
+    let mut measured = 0i64;
+    let mut unknown = 0i64;
+    let mut expected_input = 0i64;
+    for (i, sample) in samples.iter().enumerate() {
+        let input = if sample % 2 == 0 { Some(*sample as i64) } else { None };
+        if let Some(value) = input { measured += 1; expected_input += value; } else { unknown += 1; }
+        store.insert_usage(&UsageRecord {
+            id: 0, request_id: format!("request-{i}"), ts: i as i64, endpoint: "/v1/responses".into(), backend: "codex".into(), model: format!("model-{}", i % 2), account_id: format!("account-{}", i % 3), account_label: format!("label-{}", i % 3), cache_key: Some(format!("key-{}", i % 4)), status: 200, input_tokens: input, output_tokens: input,
+        }).unwrap();
+    }
+    let total = store.usage_summary(&UsageQuery::default()).unwrap();
+    assert_eq!(total[0].requests, samples.len() as i64);
+    assert_eq!(total[0].measured_requests, measured);
+    assert_eq!(total[0].unknown_requests, unknown);
+    assert_eq!(total[0].input_tokens, expected_input);
+    let grouped = store.usage_summary(&UsageQuery { group_by: Some("model,account_id,cache_key".into()), ..Default::default() }).unwrap();
+    assert_eq!(grouped.iter().map(|g| g.requests).sum::<i64>(), samples.len() as i64);
+    assert_eq!(grouped.iter().map(|g| g.input_tokens).sum::<i64>(), expected_input);
+}
 
 #[hegel::test]
 fn test_reset_candidate_has_latest_natural_recovery(tc: TestCase) {

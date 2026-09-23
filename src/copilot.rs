@@ -340,6 +340,22 @@ impl CopilotBackend {
 }
 
 impl Backend for CopilotBackend {
+    /// @cc [owner:ghuntley,label:accounting] copilot-stream-usage
+    /// For streamed chat completions, request final usage only when the client has not supplied
+    /// `stream_options.include_usage`; explicit client settings MUST be preserved.
+    fn auto_stream_usage(&self, path: &str, body: &mut Value) -> bool {
+        if !path.ends_with("/chat/completions") || body.get("stream").and_then(Value::as_bool) != Some(true) { return false; }
+        let Some(obj) = body.as_object_mut() else { return false; };
+        if let Some(options) = obj.get_mut("stream_options") {
+            let Some(options) = options.as_object_mut() else { return false; };
+            if options.contains_key("include_usage") { return false; }
+            options.insert("include_usage".into(), Value::Bool(true));
+        } else {
+            obj.insert("stream_options".into(), serde_json::json!({"include_usage": true}));
+        }
+        true
+    }
+
     fn id(&self) -> BackendId {
         BackendId::Copilot
     }
@@ -416,6 +432,17 @@ pub fn fallback_catalog() -> Vec<ModelInfo> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stream_usage_preserves_explicit_client_choice() {
+        let backend = CopilotBackend { cooldown_ms: 1000 };
+        let mut body = json!({"stream": true, "stream_options": {"include_usage": false, "other": 1}});
+        assert!(!backend.auto_stream_usage("/v1/chat/completions", &mut body));
+        assert_eq!(body["stream_options"], json!({"include_usage": false, "other": 1}));
+        let mut responses = json!({"stream": true});
+        assert!(!backend.auto_stream_usage("/v1/responses", &mut responses));
+        assert!(responses.get("stream_options").is_none());
+    }
 
     #[test]
     fn enterprise_urls_rewrite_to_copilot_api_host() {

@@ -132,6 +132,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
                 .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string()),
             cfg.auto_codex_resets,
         )),
+        stream_usage_unsupported: Mutex::new(Default::default()),
     });
 
     {
@@ -177,6 +178,8 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
 
     let app = axum::Router::new()
         .route("/admin/api/state", axum::routing::get(ui::state))
+        .route("/admin/api/usage", axum::routing::get(ui::usage_summary))
+        .route("/admin/api/usage/requests", axum::routing::get(ui::usage_requests))
         .route("/admin/api/flows", axum::routing::post(ui::start_flow))
         .route("/admin/api/flows/{id}", axum::routing::get(ui::flow_status))
         .route(

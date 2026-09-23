@@ -62,6 +62,7 @@ opencode --provider underclass --model underclass/gpt-5.5
 - **Sticky sessions.** Requests carrying `prompt_cache_key` / `promptCacheKey` (opencode sends the session ID when configured with `setCacheKey: true`) always land on the same subscription. Bindings live for 24h, survive restarts, and rebind preferentially within the same backend when an account cools.
 - **Health pool.** A quota response (`429`/usage-limit bodies) moves an account to *cooling* until `retry-after` (or a per-backend default). 401s trigger one token refresh + retry, then the account needs re-login. Cooling accounts stay configured and return to rotation automatically.
 - **Codex usage and banked resets.** The admin page shows per-account usage windows and available reset credits. When a live request finds every enabled ChatGPT/Codex account unavailable, underclass can redeem one banked reset, choosing the account that would otherwise wait longest for natural quota recovery. This is enabled by default; set `auto_codex_resets = false` in `~/.config/underclass/config.toml` or `UNDERCLASS_AUTO_CODEX_RESETS=false` to disable automatic redemption.
+- **Token accounting.** Each upstream attempt is recorded in SQLite with its model, account, prompt cache key, and reported input/output tokens. Missing counts remain marked unknown. The admin page shows current-month totals and filters; historical rows remain queryable after account removal.
 - **Fail fast.** If every account eligible for the requested model is cooling, the proxy answers `429` + `Retry-After` = earliest reset. No queuing.
 - **Flat pool.** Codex and Copilot accounts compete by least-in-flight, filtered by per-backend model catalogs. Unknown model IDs pass through to Codex so new models work without proxy changes.
 - **Pre-first-byte failover only.** Once a stream starts, upstream errors pass through — no silent re-send of half-finished turns.
@@ -103,6 +104,8 @@ underclass connect [--base-url URL] [--api-key KEY] [--model MODEL]
 | `GET /v1/models` | proxy key | union catalog with merged limits |
 | `GET /` | none | web UI |
 | `GET /admin/api/state` | admin token | accounts, catalog, last 200 requests |
+| `GET /admin/api/usage` | admin token | token totals grouped by `group_by=model,account_id,cache_key` (any subset) |
+| `GET /admin/api/usage/requests` | admin token | paginated per-attempt accounting rows |
 | `POST /admin/api/flows` | admin token | start a device-flow onboarding |
 | `GET /admin/api/flows/{id}` | admin token | poll an onboarding flow |
 | `POST /admin/api/accounts/{id}/enable|disable|relogin` | admin token | account controls |
@@ -111,6 +114,8 @@ underclass connect [--base-url URL] [--api-key KEY] [--model MODEL]
 | `GET /admin/api/client-key` | admin token | retrieve the proxy key for `connect` |
 
 Every response carries `x-request-id`; logs are JSON (`RUST_LOG` filters, `--log-format json|pretty`) and each request logs the account (label) that served it.
+
+Accounting queries accept `from_ms` (inclusive), `to_ms` (exclusive), and exact `model`, `account_id`, or `cache_key` filters. Use `missing_key=true` to select requests without a key. Grouped summaries and request details accept `limit` (1–1000, default 100) and `offset`; summary responses also include unpaginated `totals`. With no time bounds, queries default to the current UTC month; provide `from_ms=0` to query all history. Each summary includes measured and unknown request counts. Token totals sum reported values only; they are lower bounds when unknown requests exist. See [ADR 0014](docs/adr/0014-per-attempt-token-accounting.md).
 
 ### Correlation with preflight
 

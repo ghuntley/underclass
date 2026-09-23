@@ -3,6 +3,8 @@ use crate::models::{now_ms, BackendId, Outcome, RequestLogEntry};
 use crate::pool::{Decision, PoolCore, SelectError, Selection};
 use crate::provider::BackendMap;
 use crate::store::Store;
+use crate::store::UsageRecord;
+use crate::usage::{UsageTap, usage_from_json};
 use crate::tokens::TokenManager;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -30,6 +32,37 @@ pub struct AppState {
     pub proxy_key: Option<String>,
     pub ui_token: String,
     pub resets: Arc<crate::resets::ResetManager>,
+    pub stream_usage_unsupported: Mutex<std::collections::HashSet<BackendId>>,
+}
+
+struct UsageFinish {
+    store: Arc<Store>,
+    record: UsageRecord,
+    tap: UsageTap,
+}
+
+impl Drop for UsageFinish {
+    fn drop(&mut self) {
+        if let Some(counts) = self.tap.counts() {
+            self.record.input_tokens = Some(counts.input_tokens);
+            self.record.output_tokens = Some(counts.output_tokens);
+        }
+        persist_usage(&self.store, &self.record);
+    }
+}
+
+fn persist_usage(store: &Store, record: &UsageRecord) {
+    if let Err(error) = store.insert_usage(record) {
+        tracing::error!(request_id = %record.request_id, error = %error, "usage.persist_failed");
+    } else {
+        tracing::info!(request_id = %record.request_id, measured = record.input_tokens.is_some(), input_tokens = record.input_tokens, output_tokens = record.output_tokens, "usage.recorded");
+    }
+}
+
+fn usage_record(request_id: &str, path: &str, model: &str, sticky: Option<&str>, selection: &Selection, account: &crate::models::Account, status: u16) -> UsageRecord {
+    UsageRecord {
+        id: 0, request_id: request_id.to_string(), ts: now_ms(), endpoint: path.to_string(), backend: selection.backend.as_str().to_string(), model: model.to_string(), account_id: selection.account_id.clone(), account_label: account.label.clone(), cache_key: sticky.map(str::to_string), status, input_tokens: None, output_tokens: None,
+    }
 }
 
 pub fn extract_sticky_key(body: &Value, session_header: Option<&str>) -> Option<String> {
@@ -362,12 +395,15 @@ async fn attempt_account(
     let mut outbound_body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
     backend.inject_headers(&account, &token, sticky, &outbound_body, &mut headers);
     backend.prepare_body(&mut outbound_body);
+    let fallback_body = outbound_body.clone();
+    let auto_usage = !state.stream_usage_unsupported.lock().unwrap().contains(&selection.backend)
+        && backend.auto_stream_usage(path, &mut outbound_body);
     let outbound_bytes = serde_json::to_vec(&outbound_body).unwrap_or_else(|_| body_bytes.to_vec());
 
-    let response = match state
+    let mut response = match state
         .client
         .post(&url)
-        .headers(headers)
+        .headers(headers.clone())
         .body(outbound_bytes)
         .send()
         .await
@@ -375,15 +411,53 @@ async fn attempt_account(
         Ok(resp) => resp,
         Err(e) => {
             tracing::warn!(request_id = %request_id, error = %e, backend = %selection.backend.as_str(), "upstream.network_error");
+            let record = usage_record(request_id, path, model, sticky, selection, &account, 0);
+            persist_usage(&state.store, &record);
             report_outcome(state, &selection.account_id, Outcome::Transient);
             drop(guard);
             return Attempt::Failover(None);
         }
     };
 
+    if auto_usage && matches!(response.status().as_u16(), 400 | 422) {
+        let status = response.status();
+        let rejection = response.text().await.unwrap_or_default();
+        if rejection.contains("stream_options") || rejection.contains("include_usage") {
+            let rejected = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16());
+            persist_usage(&state.store, &rejected);
+            state.stream_usage_unsupported.lock().unwrap().insert(selection.backend);
+            tracing::warn!(request_id = %request_id, backend = %selection.backend.as_str(), "usage.stream_option_unsupported");
+            let retry_bytes = serde_json::to_vec(&fallback_body).unwrap_or_else(|_| body_bytes.to_vec());
+            response = match state.client.post(&url).headers(headers).body(retry_bytes).send().await {
+                Ok(resp) => resp,
+                Err(error) => {
+                    tracing::warn!(request_id = %request_id, error = %error, "upstream.network_error");
+                    let record = usage_record(request_id, path, model, sticky, selection, &account, 0);
+                    persist_usage(&state.store, &record);
+                    drop(guard);
+                    return Attempt::Failover(None);
+                }
+            };
+        } else {
+            let record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16());
+            persist_usage(&state.store, &record);
+            push_log(state, request_id, model, Some(selection.backend.as_str().to_string()), Some(selection.account_id.clone()), Some(account.label.clone()), sticky.unwrap_or("none"), status.as_u16(), started.elapsed().as_millis() as u64);
+            drop(guard);
+            return Attempt::Failover(Some(upstream_error_response(status, "application/json", rejection)));
+        }
+    }
+
     let status = response.status();
 
     if status == StatusCode::UNAUTHORIZED && refreshed.insert(selection.account_id.clone()) {
+        let body_text = response.text().await.unwrap_or_default();
+        let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16());
+        if let Ok(value) = serde_json::from_str::<Value>(&body_text)
+            && let Some(counts) = usage_from_json(&value, backend.usage_is_chat(path)) {
+            record.input_tokens = Some(counts.input_tokens);
+            record.output_tokens = Some(counts.output_tokens);
+        }
+        persist_usage(&state.store, &record);
         match state.tokens.force_refresh(&selection.account_id).await {
             Ok(_) => {
                 report_outcome(state, &selection.account_id, Outcome::Transient);
@@ -403,6 +477,13 @@ async fn attempt_account(
     if !status.is_success() {
         let resp_headers = response.headers().clone();
         let body_text = response.text().await.unwrap_or_default();
+        let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16());
+        if let Ok(value) = serde_json::from_str::<Value>(&body_text)
+            && let Some(counts) = usage_from_json(&value, backend.usage_is_chat(path)) {
+            record.input_tokens = Some(counts.input_tokens);
+            record.output_tokens = Some(counts.output_tokens);
+        }
+        persist_usage(&state.store, &record);
         let outcome = backend.classify(status.as_u16(), &body_text, &resp_headers, now_ms());
         if let Some(new_status) = {
             let mut pool = state.pool.lock().unwrap();
@@ -455,17 +536,25 @@ async fn attempt_account(
             .unwrap_or(http::HeaderValue::from_static("application/json"));
         let status_code = status;
         let stream = response.bytes_stream();
+        let finish = UsageFinish {
+            store: state.store.clone(),
+            record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16()),
+            tap: UsageTap::new(content_type.as_bytes().starts_with(b"text/event-stream"), backend.usage_is_chat(path)),
+        };
         let body_stream = Body::from_stream(futures::stream::unfold(
-            (stream, Some(guard)),
-            |(mut stream, guard)| async move {
+            (stream, Some(guard), finish),
+            |(mut stream, guard, mut finish)| async move {
                 match stream.next().await {
-                    Some(Ok(chunk)) => Some((Ok::<_, std::io::Error>(chunk), (stream, guard))),
+                    Some(Ok(chunk)) => {
+                        finish.tap.feed(&chunk);
+                        Some((Ok::<_, std::io::Error>(chunk), (stream, guard, finish)))
+                    },
                     Some(Err(_)) => Some((
                         Err(std::io::Error::new(
                             std::io::ErrorKind::Interrupted,
                             "upstream stream error",
                         )),
-                        (stream, guard),
+                        (stream, guard, finish),
                     )),
                     None => None,
                 }

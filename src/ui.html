@@ -56,6 +56,32 @@
   </section>
 
   <section class="card">
+    <h2 style="margin-top:0">Token accounting</h2>
+    <p class="muted">Upstream reported tokens. Requests without usage are counted as unknown. Default range: current UTC month.</p>
+    <div class="row" style="flex-wrap:wrap">
+      <input id="usageFrom" type="datetime-local" aria-label="From UTC" title="From UTC">
+      <input id="usageTo" type="datetime-local" aria-label="To UTC" title="To UTC">
+      <input id="usageModel" placeholder="model" aria-label="Model">
+      <input id="usageAccount" list="usageAccounts" placeholder="account ID" aria-label="Account ID">
+      <datalist id="usageAccounts"></datalist>
+      <input id="usageKey" placeholder="prompt cache key" aria-label="Prompt cache key">
+      <label><input id="usageMissingKey" type="checkbox"> no cache key</label>
+      <button onclick="loadUsage()">Query</button>
+    </div>
+    <div class="row" style="flex-wrap:wrap;margin-top:8px">
+      <label><input id="groupModel" type="checkbox" checked> model</label>
+      <label><input id="groupAccount" type="checkbox" checked> account</label>
+      <label><input id="groupKey" type="checkbox"> cache key</label>
+    </div>
+    <p id="usageTotals" class="muted"></p>
+    <table id="usageGroups"><thead><tr><th>model</th><th>account</th><th>cache key</th><th>requests</th><th>unknown</th><th>input</th><th>output</th></tr></thead><tbody></tbody></table>
+    <button id="usageMoreGroups" onclick="loadMoreUsageGroups()">More groups</button>
+    <h2>Request details</h2>
+    <table id="usageDetails"><thead><tr><th>time</th><th>request id</th><th>model</th><th>account</th><th>cache key</th><th>status</th><th>input</th><th>output</th></tr></thead><tbody></tbody></table>
+    <button id="usageMore" onclick="loadMoreUsage()">More requests</button>
+  </section>
+
+  <section class="card">
     <h2 style="margin-top:0">Recent requests</h2>
     <table id="requests">
       <thead><tr><th>time</th><th>request id</th><th>model</th><th>backend</th><th>account</th><th>sticky</th><th>status</th><th>ms</th></tr></thead>
@@ -130,6 +156,9 @@
 
 <script>
 let flowTimer = null;
+let usageOffset = 0;
+let usageGroupOffset = 0;
+let usageLoaded = false;
 
 function token() { return localStorage.getItem('underclass_token') || ''; }
 function saveToken() {
@@ -176,6 +205,9 @@ async function loadState() {
         </td>`;
       tbody.appendChild(tr);
     }
+    const accountChoices = document.getElementById('usageAccounts');
+    accountChoices.innerHTML = '';
+    for (const a of data.accounts) accountChoices.appendChild(new Option(a.label + ' (' + a.backend + ')', a.id));
     const rbody = document.querySelector('#requests tbody');
     rbody.innerHTML = '';
     for (const r of data.requests.slice(0, 50)) {
@@ -187,7 +219,75 @@ async function loadState() {
       rbody.appendChild(tr);
     }
     document.getElementById('snippet').textContent = JSON.stringify(snippet(data.catalog), null, 2);
+    if (!usageLoaded) await loadUsage();
   } catch (e) { /* token dialog already handling 401 */ }
+}
+
+function usageParams() {
+  const params = new URLSearchParams();
+  const from = document.getElementById('usageFrom').value;
+  const to = document.getElementById('usageTo').value;
+  if (from) params.set('from_ms', Date.parse(from + 'Z'));
+  if (to) params.set('to_ms', Date.parse(to + 'Z'));
+  const model = document.getElementById('usageModel').value.trim();
+  const account = document.getElementById('usageAccount').value;
+  const key = document.getElementById('usageKey').value;
+  if (model) params.set('model', model);
+  if (account) params.set('account_id', account);
+  if (key) params.set('cache_key', key);
+  if (document.getElementById('usageMissingKey').checked) params.set('missing_key', 'true');
+  const groups = [];
+  if (document.getElementById('groupModel').checked) groups.push('model');
+  if (document.getElementById('groupAccount').checked) groups.push('account_id');
+  if (document.getElementById('groupKey').checked) groups.push('cache_key');
+  params.set('group_by', groups.join(','));
+  return params;
+}
+
+async function loadUsage() {
+  usageOffset = 0;
+  usageGroupOffset = 0;
+  document.querySelector('#usageGroups tbody').innerHTML = '';
+  await loadMoreUsageGroups();
+  await loadMoreUsage();
+  usageLoaded = true;
+}
+
+async function loadMoreUsageGroups() {
+  const params = usageParams();
+  params.set('limit', '100');
+  params.set('offset', String(usageGroupOffset));
+  const res = await api('/admin/api/usage?' + params);
+  if (!res.ok) { document.getElementById('usageTotals').textContent = 'Usage query failed: ' + await res.text(); return; }
+  const data = await res.json();
+  const total = data.totals;
+  document.getElementById('usageTotals').textContent = `${total.requests} attempts · ${total.unknown_requests} unknown · ${total.input_tokens} input tokens · ${total.output_tokens} output tokens`;
+  const body = document.querySelector('#usageGroups tbody');
+  for (const row of data.groups) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${esc(row.model ?? 'all')}</td><td>${esc(row.account_label ?? row.account_id ?? 'all')}</td><td>${esc(row.cache_key ?? '—')}</td><td>${row.requests}</td><td>${row.unknown_requests}</td><td>${row.input_tokens}</td><td>${row.output_tokens}</td>`;
+    body.appendChild(tr);
+  }
+  usageGroupOffset += data.groups.length;
+  document.getElementById('usageMoreGroups').hidden = data.groups.length < 100 || !params.get('group_by');
+}
+
+async function loadMoreUsage() {
+  const params = usageParams();
+  params.set('limit', '50');
+  params.set('offset', String(usageOffset));
+  const res = await api('/admin/api/usage/requests?' + params);
+  if (!res.ok) return;
+  const data = await res.json();
+  const body = document.querySelector('#usageDetails tbody');
+  if (usageOffset === 0) body.innerHTML = '';
+  for (const row of data.requests) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${new Date(row.ts).toLocaleString()}</td><td>${esc(row.request_id.slice(0,8))}</td><td>${esc(row.model)}</td><td>${esc(row.account_label)}</td><td>${esc(row.cache_key ?? '—')}</td><td>${row.status}</td><td>${row.input_tokens ?? '?'}</td><td>${row.output_tokens ?? '?'}</td>`;
+    body.appendChild(tr);
+  }
+  usageOffset += data.requests.length;
+  document.getElementById('usageMore').hidden = data.requests.length < 50;
 }
 
 function formatUsage(usage) {
