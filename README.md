@@ -129,7 +129,7 @@ Underclass accepts one hyphenated RFC4122 UUIDv4 and normalizes it to lowercase.
 
 ## Models
 
-The catalog is data, not code: seeded with the Codex families (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`) and Copilot's live `/models` list. Edit it in the UI or via the admin API; routing eligibility and the opencode model block follow it. See [ADR 0007](docs/adr/0007-config-driven-model-catalog.md).
+The catalog is data, not code: seeded with the Codex families (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex-spark`, `gpt-5.5`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra`, `gpt-6-sol`) and Copilot's live `/models` list. Edit it in the UI or via the admin API; routing eligibility and the opencode model block follow it. See [ADR 0007](docs/adr/0007-config-driven-model-catalog.md).
 
 ## Nix flake
 
