@@ -281,7 +281,11 @@ mod monitor_socket_tests {
 
     #[tokio::test]
     async fn keeps_live_socket_and_recovers_stale_socket() {
-        let dir = std::env::temp_dir().join(format!("underclass-monitor-{}", uuid::Uuid::new_v4()));
+        // macOS expands std::env::temp_dir() to a long per-user path that can exceed SUN_LEN.
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
+            "ucm-{}",
+            &uuid::Uuid::new_v4().to_string()[..8]
+        ));
         let path = dir.join("monitor.sock");
         let first = bind_monitor_socket(&path).unwrap();
         assert!(bind_monitor_socket(&path).is_err());
