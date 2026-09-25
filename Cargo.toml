@@ -33,4 +33,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 uuid = { version = "1.26.1", features = ["v4"] }
 
 [dev-dependencies]
-hegeltest = "0.46.1"
+hegeltest = "0.47.0"
