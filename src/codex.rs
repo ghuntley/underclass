@@ -362,24 +362,26 @@ impl Backend for CodexBackend {
     }
 }
 
-pub fn default_catalog() -> Vec<crate::models::ModelInfo> {    let entries: &[(&str, &str, i64)] = &[
-        ("gpt-5.4", "GPT-5.4", 400_000),
-        ("gpt-5.4-mini", "GPT-5.4 Mini", 400_000),
-        ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", 400_000),
-        ("gpt-5.5", "GPT-5.5", 400_000),
-        ("gpt-5.6-sol", "GPT-5.6 Sol", 400_000),
-        ("gpt-5.6-terra", "GPT-5.6 Terra", 400_000),
-        ("gpt-5.6-luna", "GPT-5.6 Luna", 400_000),
-        ("gpt-6-astra", "GPT-6 Astra", 400_000),
+pub fn default_catalog() -> Vec<crate::models::ModelInfo> {
+    let entries: &[(&str, &str, i64, i64, i64)] = &[
+        ("gpt-5.4", "GPT-5.4", 400_000, 272_000, 128_000),
+        ("gpt-5.4-mini", "GPT-5.4 Mini", 400_000, 272_000, 128_000),
+        ("gpt-5.3-codex-spark", "GPT-5.3 Codex Spark", 400_000, 272_000, 128_000),
+        ("gpt-5.5", "GPT-5.5", 400_000, 272_000, 128_000),
+        ("gpt-5.6-sol", "GPT-5.6 Sol", 400_000, 272_000, 128_000),
+        ("gpt-5.6-terra", "GPT-5.6 Terra", 400_000, 272_000, 128_000),
+        ("gpt-5.6-luna", "GPT-5.6 Luna", 400_000, 272_000, 128_000),
+        ("gpt-6-astra", "GPT-6 Astra", 400_000, 272_000, 128_000),
+        ("gpt-6-sol", "GPT-6 Sol", 1_050_000, 922_000, 128_000),
     ];
     entries
         .iter()
-        .map(|(id, name, context)| crate::models::ModelInfo {
+        .map(|(id, name, context, input, output)| crate::models::ModelInfo {
             id: id.to_string(),
             name: name.to_string(),
             context: *context,
-            input: 272_000,
-            output: 128_000,
+            input: *input,
+            output: *output,
         })
         .collect()
 }
@@ -457,6 +459,17 @@ mod tests {
             backend.rewrite_url("/v1/other", &account),
             "https://api.openai.com/v1/other"
         );
+    }
+
+    #[test]
+    fn default_catalog_includes_gpt_6_sol_limits() {
+        let model = default_catalog()
+            .into_iter()
+            .find(|model| model.id == "gpt-6-sol")
+            .expect("gpt-6-sol must be in the default catalog");
+        assert_eq!(model.context, 1_050_000);
+        assert_eq!(model.input, 922_000);
+        assert_eq!(model.output, 128_000);
     }
 
     #[test]
