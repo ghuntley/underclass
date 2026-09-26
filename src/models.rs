@@ -48,6 +48,10 @@ pub struct Account {
     pub access_token: Option<String>,
     #[serde(default)]
     pub expires_at: i64,
+    /// Wall-clock time of the last successful token refresh, used to schedule proactive
+    /// refresh-token rotation. `0` means the token was never rotated by underclass.
+    #[serde(default)]
+    pub token_refreshed_at: i64,
     #[serde(default)]
     pub account_id: Option<String>,
     #[serde(default)]

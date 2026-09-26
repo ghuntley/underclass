@@ -81,6 +81,7 @@ fn schema() -> &'static str {
         refresh_token TEXT,
         access_token TEXT,
         expires_at INTEGER NOT NULL DEFAULT 0,
+        token_refreshed_at INTEGER NOT NULL DEFAULT 0,
         account_id TEXT,
         residency TEXT,
         enterprise_url TEXT,
@@ -132,6 +133,25 @@ fn schema() -> &'static str {
     CREATE INDEX IF NOT EXISTS usage_records_ts ON usage_records(ts, id);
     CREATE INDEX IF NOT EXISTS usage_records_dims ON usage_records(model, account_id, cache_key, ts);
     "#
+}
+
+/// Adds columns introduced after the initial schema.
+///
+/// `CREATE TABLE IF NOT EXISTS` silently leaves an already-created table alone, so a new column
+/// must be applied explicitly. `PRAGMA table_info` is consulted rather than matching on the
+/// "duplicate column name" error text, so the check does not depend on SQLite's message wording.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(accounts)")?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !columns.iter().any(|c| c == "token_refreshed_at") {
+        conn.execute(
+            "ALTER TABLE accounts ADD COLUMN token_refreshed_at INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 impl Store {
@@ -236,6 +256,7 @@ impl Store {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(schema())?;
+        migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -243,6 +264,7 @@ impl Store {
     pub fn in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(schema())?;
+        migrate(&conn)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 
@@ -251,7 +273,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, backend, label, refresh_token, access_token, expires_at, account_id,
-                        residency, enterprise_url, status, reset_at, created_at, updated_at
+                        residency, enterprise_url, status, reset_at, created_at, updated_at,
+                        token_refreshed_at
                  FROM accounts ORDER BY created_at",
             )
             .expect("prepare accounts");
@@ -266,6 +289,7 @@ impl Store {
                     refresh_token: row.get(3)?,
                     access_token: row.get(4)?,
                     expires_at: row.get(5)?,
+                    token_refreshed_at: row.get(13)?,
                     account_id: row.get(6)?,
                     residency: row.get(7)?,
                     enterprise_url: row.get(8)?,
@@ -284,7 +308,8 @@ impl Store {
         let mut stmt = conn
             .prepare(
                 "SELECT id, backend, label, refresh_token, access_token, expires_at, account_id,
-                        residency, enterprise_url, status, reset_at, created_at, updated_at
+                        residency, enterprise_url, status, reset_at, created_at, updated_at,
+                        token_refreshed_at
                  FROM accounts WHERE id = ?1",
             )
             .expect("prepare account");
@@ -298,6 +323,7 @@ impl Store {
                 refresh_token: row.get(3)?,
                 access_token: row.get(4)?,
                 expires_at: row.get(5)?,
+                token_refreshed_at: row.get(13)?,
                 account_id: row.get(6)?,
                 residency: row.get(7)?,
                 enterprise_url: row.get(8)?,
@@ -315,11 +341,13 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO accounts (id, backend, label, refresh_token, access_token, expires_at, account_id,
-                                   residency, enterprise_url, status, reset_at, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+                                   residency, enterprise_url, status, reset_at, created_at, updated_at,
+                                   token_refreshed_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
              ON CONFLICT(id) DO UPDATE SET
                 label=?3, refresh_token=?4, access_token=?5, expires_at=?6, account_id=?7,
-                residency=?8, enterprise_url=?9, status=?10, reset_at=?11, updated_at=?13",
+                residency=?8, enterprise_url=?9, status=?10, reset_at=?11, updated_at=?13,
+                token_refreshed_at=?14",
             params![
                 a.id,
                 a.backend.as_str(),
@@ -334,6 +362,7 @@ impl Store {
                 a.reset_at,
                 a.created_at,
                 a.updated_at,
+                a.token_refreshed_at,
             ],
         )
         .expect("upsert account");
@@ -398,9 +427,10 @@ impl Store {
     }
 
     /// @cc [owner:ghuntley,label:persistence] token-rotation-write-through
-    /// `update_tokens` MUST persist the new access token, expiry, and (when present) rotated
-    /// refresh token, ChatGPT account id, and residency immediately; a `None` refresh token MUST
-    /// leave the previously stored one intact.
+    /// `update_tokens` MUST persist the new access token, expiry, `token_refreshed_at`, and (when
+    /// present) rotated refresh token, ChatGPT account id, and residency immediately; a `None`
+    /// refresh token MUST leave the previously stored one intact. `token_refreshed_at` MUST be set
+    /// to the same instant as `updated_at` so scheduled rotation measures from the write.
     pub fn update_tokens(
         &self,
         id: &str,
@@ -411,14 +441,16 @@ impl Store {
         residency: Option<&str>,
     ) {
         let conn = self.conn.lock().unwrap();
+        let now = crate::models::now_ms();
         conn.execute(
             "UPDATE accounts SET refresh_token = COALESCE(?2, refresh_token),
                     access_token = ?3, expires_at = ?4,
                     account_id = COALESCE(?5, account_id),
                     residency = COALESCE(?6, residency),
+                    token_refreshed_at = ?7,
                     updated_at = ?7
              WHERE id = ?1",
-            params![id, refresh_token, access_token, expires_at, chatgpt_account_id, residency, crate::models::now_ms()],
+            params![id, refresh_token, access_token, expires_at, chatgpt_account_id, residency, now],
         )
         .expect("update tokens");
     }
@@ -541,6 +573,52 @@ fn parse_status(s: &str) -> AccountStatus {
 #[cfg(test)]
 mod tests {
     use super::{Store, UsageQuery, UsageRecord};
+
+    /// A store created before `token_refreshed_at` existed must gain the column on open, keep its
+    /// rows, and default the new column to 0 so the account reads back rather than erroring.
+    #[test]
+    fn opening_a_legacy_store_adds_the_rotation_column_without_losing_rows() {
+        let path = std::env::temp_dir().join(format!("underclass-legacy-{}.db", uuid::Uuid::new_v4()));
+        {
+            // Recreate the pre-migration accounts table exactly as it shipped.
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE accounts (
+                    id TEXT PRIMARY KEY,
+                    backend TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    refresh_token TEXT,
+                    access_token TEXT,
+                    expires_at INTEGER NOT NULL DEFAULT 0,
+                    account_id TEXT,
+                    residency TEXT,
+                    enterprise_url TEXT,
+                    status TEXT NOT NULL DEFAULT 'healthy',
+                    reset_at INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO accounts (id, backend, label, refresh_token, access_token, expires_at,
+                                      status, reset_at, created_at, updated_at)
+                 VALUES ('legacy', 'codex', 'owner@example.test', 'refresh', 'access', 999,
+                         'cooling', 4242, 7, 8);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let account = store.get_account("legacy").expect("legacy row must survive migration");
+        assert_eq!(account.label, "owner@example.test");
+        assert_eq!(account.expires_at, 999);
+        assert_eq!(account.reset_at, 4242);
+        assert_eq!(account.token_refreshed_at, 0, "new column must default to never-rotated");
+
+        // Re-opening must be a no-op rather than a duplicate-column error.
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        assert_eq!(reopened.list_accounts().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn monitor_buckets_and_account_totals_respect_bounds_and_unknowns() {

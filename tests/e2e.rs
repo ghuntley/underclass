@@ -171,6 +171,7 @@ fn account(id: &str, backend: BackendId, token: &str) -> Account {
         refresh_token: Some(format!("refresh-{id}")),
         access_token: Some(token.into()),
         expires_at: ts + 3_600_000,
+        token_refreshed_at: ts,
         account_id: Some(format!("chatgpt-{id}")),
         residency: None,
         enterprise_url: None,

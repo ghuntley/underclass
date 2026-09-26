@@ -748,6 +748,7 @@ mod tests {
             refresh_token: Some("unused".into()),
             access_token: Some("test-token".into()),
             expires_at: i64::MAX,
+            token_refreshed_at: 0,
             account_id: Some("chatgpt-account".into()),
             residency: None,
             enterprise_url: None,

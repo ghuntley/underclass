@@ -4,6 +4,7 @@ use underclass::models::{Account, AccountStatus, BackendId, Outcome};
 use underclass::pool::{PoolCore, SelectError};
 use underclass::store::{Store, UsageQuery, UsageRecord};
 use underclass::resets::{Candidate, RateLimit, Window, blocked_cooling_deadline, choose_candidate, natural_recovery_ms};
+use underclass::tokens::{ROTATION_INTERVAL_MS, rotation_due};
 use underclass::usage::{TokenCounts, UsageTap};
 use std::collections::HashMap;
 
@@ -166,6 +167,26 @@ fn test_blocked_usage_never_shortens_cooling(tc: TestCase) {
     );
 }
 
+/// A rotation writes `token_refreshed_at`, which is what the next due check reads. Whatever the
+/// clock said before, a freshly rotated account must not come due again until a full interval has
+/// elapsed, and must come due again once it has.
+#[hegel::test]
+fn test_rotation_due_respects_interval_after_each_rotation(tc: TestCase) {
+    let now: i64 = tc.draw(gs::integers::<i64>().min_value(0).max_value(1_000_000_000_000));
+    let mut rotated = account("acct", BackendId::Codex);
+    rotated.refresh_token = Some("refresh".into());
+    rotated.token_refreshed_at = now;
+    assert!(!rotation_due(&rotated, now));
+    assert!(!rotation_due(&rotated, now + ROTATION_INTERVAL_MS - 1));
+    assert!(rotation_due(&rotated, now + ROTATION_INTERVAL_MS));
+    assert!(rotation_due(&rotated, now + ROTATION_INTERVAL_MS + 1));
+    // Copilot tokens are never rotated, however old they are.
+    let mut copilot = account("acct", BackendId::Copilot);
+    copilot.refresh_token = Some("gh".into());
+    copilot.token_refreshed_at = 0;
+    assert!(!rotation_due(&copilot, now + ROTATION_INTERVAL_MS));
+}
+
 fn account(id: &str, backend: BackendId) -> Account {
     Account {
         id: id.into(),
@@ -174,6 +195,7 @@ fn account(id: &str, backend: BackendId) -> Account {
         refresh_token: None,
         access_token: None,
         expires_at: 0,
+        token_refreshed_at: 0,
         account_id: None,
         residency: None,
         enterprise_url: None,

@@ -103,6 +103,15 @@ pub fn log_reset_fetch(account_id: &str, label: &str, reason: &str) {
     );
 }
 
+pub fn log_token_rotation(account_id: &str, label: &str, event: &str, detail: &str) {
+    tracing::info!(
+        account = %label,
+        account_id = %truncate(account_id),
+        detail = %detail,
+        "token.{event}"
+    );
+}
+
 fn truncate(id: &str) -> String {
     if id.len() <= 8 {
         id.to_string()

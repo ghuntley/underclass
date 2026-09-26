@@ -64,6 +64,7 @@ pub fn new_account(backend: BackendId, label: String) -> Account {
         refresh_token: None,
         access_token: None,
         expires_at: 0,
+        token_refreshed_at: 0,
         account_id: None,
         residency: None,
         enterprise_url: None,

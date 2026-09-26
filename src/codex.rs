@@ -192,6 +192,7 @@ pub async fn start_flow(
                                     account.residency = residency.or(account.residency);
                                     account.status = crate::models::AccountStatus::Healthy;
                                     account.reset_at = 0;
+                                    account.token_refreshed_at = ts;
                                     account.updated_at = ts;
                                     store.upsert_account(&account);
                                     flows.set_state(&flow_id, FlowState::Authorized {
@@ -213,6 +214,7 @@ pub async fn start_flow(
                                 account.expires_at = ts + (tokens.expires_in.unwrap_or(3600) as i64) * 1000;
                                 account.account_id = account_id_claim;
                                 account.residency = residency;
+                                account.token_refreshed_at = ts;
                                 store.upsert_account(&account);
                                 flows.set_state(&flow_id, FlowState::Authorized {
                                     account_id: account.id.clone(),

@@ -7,6 +7,11 @@ use std::sync::{Arc, Mutex};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 
+/// How often the scheduled rotation loop re-evaluates which refresh tokens are due. The rotation
+/// window itself is `tokens::ROTATION_INTERVAL_MS`; this only bounds how late a due token can be,
+/// so a coarse tick keeps the 24h cadence cheap without pinning a timer to the exact deadline.
+const ROTATION_TICK: std::time::Duration = std::time::Duration::from_secs(900);
+
 #[derive(Parser)]
 #[command(name = "underclass", about = "pooled multi-subscription codex/copilot proxy for opencode")]
 struct Cli {
@@ -172,6 +177,15 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         let state = state.clone();
         tokio::spawn(async move {
             loop {
+                rotate_due_tokens(&state).await;
+                tokio::time::sleep(ROTATION_TICK).await;
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
                 for account in state.store.list_accounts() {
                     state.resets.poll_account(&account, &state.tokens, &state.pool, &state.store).await;
                 }
@@ -325,6 +339,30 @@ async fn refresh_copilot_catalogs_on_boot(state: &Arc<proxy::AppState>) {
 
 fn is_generic_label(label: &str) -> bool {
     matches!(label, "chatgpt" | "github") || label.trim().is_empty()
+}
+
+/// @cc [owner:ghuntley,label:auth] scheduled-rotation-never-bricks-account
+/// `rotate_due_tokens` MUST call `force_refresh` for every account reported due by
+/// `tokens::rotation_due`, and MUST NOT change any account's status, pool state, or cooldown for any
+/// outcome, including failure. A failed rotation MUST be logged and left for a later tick to retry
+/// rather than reported as `auth_error`, so a transient issuer outage cannot remove a working
+/// subscription from the pool.
+async fn rotate_due_tokens(state: &Arc<proxy::AppState>) {
+    let now = models::now_ms();
+    for account in state.store.list_accounts() {
+        if !tokens::rotation_due(&account, now) {
+            continue;
+        }
+        match state.tokens.force_refresh(&account.id).await {
+            Ok(_) => logging::log_token_rotation(&account.id, &account.label, "rotated", "scheduled"),
+            Err(e) => logging::log_token_rotation(
+                &account.id,
+                &account.label,
+                "rotation_failed",
+                &e.to_string(),
+            ),
+        }
+    }
 }
 
 async fn refresh_identities_on_boot(state: &Arc<proxy::AppState>) {
