@@ -20,6 +20,9 @@ struct MockState {
     fourtwonined: VecDeque<String>,
     chat_usage_options: VecDeque<bool>,
     reject_stream_usage: bool,
+    /// Remaining 403 responses to serve per bearer token, modelling a redemption-triggered
+    /// credential rejection that a token refresh clears.
+    forbidden: std::collections::HashMap<String, u32>,
 }
 
 async fn mock_responses(
@@ -41,6 +44,16 @@ async fn mock_responses(
             axum::http::StatusCode::UNAUTHORIZED,
             [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
             r#"{"error":{"message":"bad token"}}"#.to_string(),
+        ).into_response();
+    }
+
+    let remaining = state.lock().unwrap().forbidden.get(&bearer).copied().unwrap_or(0);
+    if remaining > 0 {
+        state.lock().unwrap().forbidden.insert(bearer.clone(), remaining - 1);
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            [(axum::http::header::CONTENT_TYPE, "application/json".to_string())],
+            r#"{"error":{"message":"credential rejected"}}"#.to_string(),
         ).into_response();
     }
 
@@ -111,24 +124,42 @@ async fn mock_responses(
     }
 }
 
-async fn mock_upstream() -> &'static Arc<Mutex<MockState>> {
+/// Starts the shared mock upstream on a dedicated OS thread and returns its state.
+///
+/// The server deliberately does not live on a test's own runtime: every `#[tokio::test]` builds
+/// and then drops its runtime, which would cancel the server task and leave the cached URL
+/// pointing at a dead port for every later test in the binary. A dedicated thread with its own
+/// runtime keeps the server reachable for the lifetime of the test process.
+fn mock_upstream() -> &'static Arc<Mutex<MockState>> {
     static STATE: OnceLock<Arc<Mutex<MockState>>> = OnceLock::new();
     static URL: OnceLock<String> = OnceLock::new();
-    STATE.get_or_init(Default::default);
-    if URL.get().is_none() {
-        let app = axum::Router::new()
-            .fallback(mock_responses)
-            .with_state(STATE.get().unwrap().clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    let state = STATE.get_or_init(Default::default);
+    URL.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let served = state.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let app = axum::Router::new()
+                    .fallback(mock_responses)
+                    .with_state(served);
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                tx.send(addr).unwrap();
+                axum::serve(listener, app).await.unwrap();
+            });
+        });
+        let addr = rx.recv().expect("mock upstream failed to bind");
         unsafe {
             std::env::set_var("UNDERCLASS_CODEX_UPSTREAM", format!("http://{addr}"));
             std::env::set_var("UNDERCLASS_COPILOT_UPSTREAM", format!("http://{addr}"));
         }
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        URL.set(format!("http://{addr}")).ok();
-    }
-    STATE.get().unwrap()
+        format!("http://{addr}")
+    });
+    state
 }
 
 fn account(id: &str, backend: BackendId, token: &str) -> Account {
@@ -212,6 +243,10 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
         .route("/admin/api/monitor", axum::routing::get(underclass::monitor::snapshot))
         .route("/admin/api/usage", axum::routing::get(underclass::ui::usage_summary))
         .route("/admin/api/usage/requests", axum::routing::get(underclass::ui::usage_requests))
+        .route(
+            "/admin/api/accounts/{id}/enable",
+            axum::routing::post(underclass::ui::enable_account),
+        )
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), underclass::ui::require_ui_token));
     let app = axum::Router::new().nest("/v1", v1)
         .merge(admin)
@@ -226,7 +261,7 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
 
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_full_pool_story() {
-    let mock = mock_upstream().await;
+    let mock = mock_upstream();
 
     let store = Arc::new(Store::in_memory().unwrap());
     let m = model("gpt-5.5");
@@ -474,4 +509,95 @@ async fn e2e_full_pool_story() {
     store.delete_account("acc-1");
     let history = store.usage_records(&underclass::store::UsageQuery { account_id: Some("acc-1".into()), ..Default::default() }).unwrap();
     assert!(!history.is_empty(), "account removal must retain token accounting history");
+}
+
+/// A 403 that clears after a token refresh must not escalate the account to `auth_error`:
+/// selection never returns an `AuthError` account, so a single redemption-triggered 403 would
+/// otherwise strand a perfectly good subscription outside the pool with no way back.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_forbidden_403_refreshes_instead_of_bricking_account() {
+    let mock = mock_upstream();
+    // Copilot accounts are used deliberately: their `force_refresh` returns the stored token
+    // without a network round trip, so this exercises the 403 path hermetically.
+    let store = Arc::new(Store::in_memory().unwrap());
+    let m = model("m");
+    store.set_catalog(BackendId::Codex, &[m.clone()]);
+    store.set_catalog(BackendId::Copilot, &[m]);
+    store.upsert_account(&copilot_account("cop-403", "cop-403-token"));
+    store.upsert_account(&copilot_account("cop-spare", "cop-spare-token"));
+    mock.lock().unwrap().forbidden.insert("cop-403-token".into(), 1);
+    let (base, _logs) = spawn_app(store.clone(), 400).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", "Bearer test-key")
+        .json(&serde_json::json!({"model": "m", "input": "hi", "stream": true}))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert_eq!(status, 200, "403 account body: {body}");
+    assert!(
+        body.contains("cop-403-token"),
+        "the 403 account must be retried after refresh and serve the request, got: {body}"
+    );
+    assert_eq!(
+        store.get_account("cop-403").unwrap().status,
+        AccountStatus::Healthy,
+        "a 403 that survives one token refresh must not mark the account auth_error"
+    );
+    assert_eq!(mock.lock().unwrap().forbidden.get("cop-403-token"), Some(&0));
+}
+
+/// `enable` is the operator's recovery lever. It must clear a stranded `auth_error` account, and it
+/// must not silently discard an upstream quota deadline that `PoolCore::sweep` would honour.
+#[tokio::test(flavor = "multi_thread")]
+async fn e2e_enable_clears_auth_error_but_preserves_quota_cooldown() {
+    let _mock = mock_upstream();
+    let store = Arc::new(Store::in_memory().unwrap());
+    let m = model("m");
+    store.set_catalog(BackendId::Codex, &[m.clone()]);
+    store.set_catalog(BackendId::Copilot, &[m]);
+    store.upsert_account(&copilot_account("acct-auth", "tok-auth"));
+    store.upsert_account(&copilot_account("acct-cooling", "tok-cooling"));
+    store.upsert_account(&copilot_account("acct-disabled", "tok-disabled"));
+    let (base, _logs) = spawn_app(store.clone(), 400).await;
+    let http = reqwest::Client::new();
+
+    let enable = |id: &str| {
+        let http = http.clone();
+        let base = base.clone();
+        let id = id.to_string();
+        async move {
+            http.post(format!("{base}/admin/api/accounts/{id}/enable"))
+                .header("Authorization", "Bearer unused")
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    assert_eq!(enable("no-such-account").await.status(), 404);
+
+    // A stranded auth_error account is exactly the dead end this endpoint exists to undo.
+    store.update_account_status("acct-auth", AccountStatus::AuthError, 0);
+    assert_eq!(enable("acct-auth").await.status(), 204);
+    let authed = store.get_account("acct-auth").unwrap();
+    assert_eq!(authed.status, AccountStatus::Healthy);
+    assert_eq!(authed.reset_at, 0);
+
+    // An operator-set disable still clears.
+    store.update_account_status("acct-disabled", AccountStatus::Disabled, 0);
+    assert_eq!(enable("acct-disabled").await.status(), 204);
+    assert_eq!(store.get_account("acct-disabled").unwrap().status, AccountStatus::Healthy);
+
+    // A quota cooldown is upstream state, not an operator block: enabling must not wipe it,
+    // otherwise the account is re-selected while still out of quota.
+    let deadline = now_ms() + 3_600_000;
+    store.update_account_status("acct-cooling", AccountStatus::Cooling, deadline);
+    assert_eq!(enable("acct-cooling").await.status(), 204);
+    let cooling = store.get_account("acct-cooling").unwrap();
+    assert_eq!(cooling.status, AccountStatus::Cooling);
+    assert_eq!(cooling.reset_at, deadline, "enable must preserve an upstream quota deadline");
 }

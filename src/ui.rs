@@ -203,17 +203,23 @@ pub async fn disable_account(State(state): State<Arc<AppState>>, Path(id): Path<
     set_status(&state, &id, AccountStatus::Disabled, 0)
 }
 
+/// @cc [owner:ghuntley,label:pool] enable-clears-recoverable-status
+/// `enable_account` MUST return 404 for an unknown account id. For a `Disabled` or `AuthError`
+/// account it MUST set the status to `Healthy` and clear `reset_at` to 0, so an operator can
+/// recover an account that `PoolCore::select` would otherwise never return. For a `Cooling`
+/// account it MUST preserve both the `Cooling` status and its existing `reset_at` deadline, since
+/// that deadline originates from upstream quota rather than an operator action. For an already
+/// `Healthy` account it MUST leave the status `Healthy` and clear `reset_at` to 0.
 pub async fn enable_account(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let status = match state.store.get_account(&id) {
-        Some(a) => a.status,
-        None => return (StatusCode::NOT_FOUND, "unknown account").into_response(),
+    let Some(account) = state.store.get_account(&id) else {
+        return (StatusCode::NOT_FOUND, "unknown account").into_response();
     };
-    let next = if status == AccountStatus::Disabled {
-        AccountStatus::Healthy
-    } else {
-        status
+    let (next, reset_at) = match account.status {
+        AccountStatus::Cooling => (AccountStatus::Cooling, account.reset_at),
+        AccountStatus::Disabled | AccountStatus::AuthError => (AccountStatus::Healthy, 0),
+        AccountStatus::Healthy => (AccountStatus::Healthy, 0),
     };
-    set_status(&state, &id, next, 0)
+    set_status(&state, &id, next, reset_at)
 }
 
 pub async fn relogin_account(

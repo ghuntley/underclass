@@ -200,7 +200,7 @@ async function loadState() {
         <td>${formatCredits(a.usage)}</td>
         <td class="row">
           ${a.status === 'disabled' ? `<button onclick="acct('${a.id}','enable')">Enable</button>` : `<button onclick="acct('${a.id}','disable')">Disable</button>`}
-          ${a.status === 'auth_error' ? `<button class="primary" onclick="relogin('${a.id}')">Re-login</button>` : ''}
+          ${a.status === 'auth_error' ? `<button onclick="acct('${a.id}','enable')">Enable</button><button class="primary" onclick="relogin('${a.id}')">Re-login</button>` : ''}
           <button class="danger" onclick="del('${a.id}')">Remove</button>
         </td>`;
       tbody.appendChild(tr);

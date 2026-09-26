@@ -339,9 +339,9 @@ pub async fn infer(State(state): State<Arc<AppState>>, req: Request) -> Response
 /// after a successful banked reset, and the first successful upstream response MUST be returned
 /// to the client; upstream error bodies MUST be preserved and
 /// returned when every attempt fails (or a 503 `pool_exhausted` error when no upstream response
-/// was ever received). A 401 MUST trigger exactly one forced token refresh and one same-account
-/// retry per request; a second 401 (or a failed refresh) MUST classify the account `AuthFailed`
-/// and fail over.
+/// was ever received). An upstream 401 or 403 MUST trigger exactly one forced token refresh and one
+/// same-account retry per request; a second 401 or 403 (or a failed refresh) MUST classify the
+/// account `AuthFailed` and fail over.
 async fn attempt_account(
     state: &Arc<AppState>,
     request_id: &str,
@@ -449,7 +449,9 @@ async fn attempt_account(
 
     let status = response.status();
 
-    if status == StatusCode::UNAUTHORIZED && refreshed.insert(selection.account_id.clone()) {
+    if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+        && refreshed.insert(selection.account_id.clone())
+    {
         let body_text = response.text().await.unwrap_or_default();
         let mut record = usage_record(request_id, path, model, sticky, selection, &account, status.as_u16());
         if let Ok(value) = serde_json::from_str::<Value>(&body_text)
