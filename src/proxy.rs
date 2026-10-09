@@ -74,6 +74,11 @@ pub fn extract_sticky_key(body: &Value, session_header: Option<&str>) -> Option<
         .filter(|s| !s.is_empty())
 }
 
+fn usage_is_stream(body: &Value, content_type: &[u8]) -> bool {
+    body.get("stream").and_then(Value::as_bool) == Some(true)
+        || content_type.starts_with(b"text/event-stream")
+}
+
 /// @cc [owner:ghuntley,label:security] proxy-key-gate
 /// When a proxy key is configured, requests to `/v1/*` MUST be rejected with 401 unless the
 /// `Authorization` header carries exactly `Bearer <proxy_key>`. When no key is configured
@@ -541,7 +546,10 @@ async fn attempt_account(
         let finish = UsageFinish {
             store: state.store.clone(),
             record: usage_record(request_id, path, model, sticky, selection, &account, status.as_u16()),
-            tap: UsageTap::new(content_type.as_bytes().starts_with(b"text/event-stream"), backend.usage_is_chat(path)),
+            tap: UsageTap::new(
+                usage_is_stream(&outbound_body, content_type.as_bytes()),
+                backend.usage_is_chat(path),
+            ),
         };
         let body_stream = Body::from_stream(futures::stream::unfold(
             (stream, Some(guard), finish),
@@ -690,5 +698,13 @@ mod tests {
         assert!(extract_sticky_key(&body, None).is_none());
         let empty = json!({"prompt_cache_key": ""});
         assert!(extract_sticky_key(&empty, None).is_none());
+    }
+
+    #[test]
+    fn stream_request_overrides_incorrect_json_content_type() {
+        let body = json!({"stream": true});
+        assert!(usage_is_stream(&body, b"application/json"));
+        assert!(usage_is_stream(&json!({}), b"text/event-stream; charset=utf-8"));
+        assert!(!usage_is_stream(&json!({}), b"application/json"));
     }
 }
