@@ -17,7 +17,7 @@ http = "1.5.0"
 httpdate = "1.0.3"
 json_comments = "0.2.2"
 lru = "0.18"
-rand = "0.8"
+rand = "0.10"
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm"] }
 reqwest = { version = "0.13.5", features = ["blocking", "form", "json", "stream"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
