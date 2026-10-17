@@ -18,6 +18,59 @@ pub fn codex_endpoint() -> String {
     std::env::var("UNDERCLASS_CODEX_UPSTREAM").unwrap_or_else(|_| CODEX_ENDPOINT.to_string())
 }
 
+const CODEX_MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
+const CODEX_CLIENT_VERSIONS: &[&str] = &["99.0.0", "0.0.0"];
+
+pub async fn fetch_catalog(
+    client: &Client,
+    account: &Account,
+    token: &str,
+) -> Result<Vec<crate::models::ModelInfo>, String> {
+    let endpoint = std::env::var("UNDERCLASS_CODEX_MODELS_UPSTREAM").unwrap_or_else(|_| CODEX_MODELS_ENDPOINT.to_string());
+    let mut last_error = "catalog request failed".to_string();
+    for client_version in CODEX_CLIENT_VERSIONS {
+        let mut request = client
+            .get(format!("{endpoint}?client_version={client_version}"))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("originator", USER_AGENT)
+            .header("User-Agent", USER_AGENT);
+        if let Some(id) = &account.account_id {
+            request = request.header("ChatGPT-Account-Id", id);
+        }
+        if let Some(residency) = &account.residency {
+            request = request.header("x-openai-internal-codex-residency", residency);
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = error.to_string();
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            last_error = format!("catalog HTTP {}", response.status());
+            continue;
+        }
+        let body: Value = response.json().await.map_err(|e| e.to_string())?;
+        let entries = body.get("models").and_then(Value::as_array).ok_or_else(|| "catalog has no models array".to_string())?;
+        let models: Vec<crate::models::ModelInfo> = entries.iter().filter_map(|entry| {
+            let id = entry.get("slug").or_else(|| entry.get("id")).and_then(Value::as_str)?.trim();
+            if id.is_empty() { return None; }
+            let name = entry.get("name").and_then(Value::as_str).unwrap_or(id);
+            Some(crate::models::ModelInfo {
+                id: id.to_string(),
+                name: name.to_string(),
+                context: entry.get("context_window").or_else(|| entry.get("context")).and_then(Value::as_i64).unwrap_or(400_000),
+                input: entry.get("input").and_then(Value::as_i64).unwrap_or(272_000),
+                output: entry.get("output").and_then(Value::as_i64).unwrap_or(128_000),
+            })
+        }).collect();
+        if !models.is_empty() { return Ok(models); }
+        last_error = "catalog returned an empty model list".to_string();
+    }
+    Err(last_error)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DeviceCodeInit {
     #[serde(rename = "device_auth_id")]
@@ -373,6 +426,7 @@ pub fn default_catalog() -> Vec<crate::models::ModelInfo> {
         ("gpt-5.6-luna", "GPT-5.6 Luna", 400_000, 272_000, 128_000),
         ("gpt-6-astra", "GPT-6 Astra", 400_000, 272_000, 128_000),
         ("gpt-6-sol", "GPT-6 Sol", 1_050_000, 922_000, 128_000),
+        ("gpt-6.1-sol", "GPT-6.1 Sol", 1_050_000, 922_000, 128_000),
     ];
     entries
         .iter()
@@ -467,6 +521,17 @@ mod tests {
             .into_iter()
             .find(|model| model.id == "gpt-6-sol")
             .expect("gpt-6-sol must be in the default catalog");
+        assert_eq!(model.context, 1_050_000);
+        assert_eq!(model.input, 922_000);
+        assert_eq!(model.output, 128_000);
+    }
+
+    #[test]
+    fn default_catalog_includes_gpt_6_1_sol_limits() {
+        let model = default_catalog()
+            .into_iter()
+            .find(|model| model.id == "gpt-6.1-sol")
+            .expect("gpt-6.1-sol must be in the default catalog");
         assert_eq!(model.context, 1_050_000);
         assert_eq!(model.input, 922_000);
         assert_eq!(model.output, 128_000);

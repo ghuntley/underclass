@@ -1,5 +1,5 @@
 use underclass::provider::BackendMap;
-use underclass::{cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, stats_api, store, tokens, top, ui};
+use underclass::{catalog, cli, codex, config, copilot, flows, logging, models, monitor, pool, proxy, stats_api, store, tokens, top, ui};
 
 use clap::{Parser, Subcommand};
 use std::collections::HashMap;
@@ -181,6 +181,7 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         )),
         stream_usage_unsupported: Mutex::new(Default::default()),
         stats_retention_days: cfg.stats_retention_days,
+        catalog_refresh_secs: cfg.codex_catalog_refresh_secs,
     });
 
     {
@@ -223,7 +224,19 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         });
     }
 
+    {
+        let state = state.clone();
+        let refresh_secs = cfg.codex_catalog_refresh_secs;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(refresh_secs)).await;
+                let _ = catalog::refresh_all(&state).await;
+            }
+        });
+    }
+
     refresh_copilot_catalogs_on_boot(&state).await;
+    catalog::refresh_codex(&state).await;
     refresh_identities_on_boot(&state).await;
     {
         let state = state.clone();
@@ -295,6 +308,10 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         .route(
             "/admin/api/catalog/{backend}",
             axum::routing::get(ui::get_catalog).put(ui::put_catalog),
+        )
+        .route(
+            "/admin/api/catalog/refresh",
+            axum::routing::post(ui::refresh_catalog),
         )
         .route(
             "/admin/api/catalog/refresh-copilot",

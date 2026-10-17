@@ -188,7 +188,12 @@ pub async fn start_flow(
 
 pub async fn flow_status(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
     match state.flows.get(&id) {
-        Some(flow) => Json(json!({ "flow_id": id, "flow": flow })).into_response(),
+        Some(flow) => {
+            if state.flows.take_catalog_refresh(&id) {
+                let _ = crate::catalog::refresh_all(&state).await;
+            }
+            Json(json!({ "flow_id": id, "flow": flow })).into_response()
+        }
         None => (StatusCode::NOT_FOUND, "unknown flow").into_response(),
     }
 }
@@ -359,6 +364,10 @@ pub async fn put_catalog(
 
 pub async fn client_key(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({ "proxy_key": state.proxy_key })).into_response()
+}
+
+pub async fn refresh_catalog(State(state): State<Arc<AppState>>) -> Response {
+    Json(crate::catalog::refresh_all(&state).await).into_response()
 }
 
 pub async fn refresh_copilot_catalog(State(state): State<Arc<AppState>>) -> Response {
