@@ -235,6 +235,7 @@ async fn spawn_app(store: Arc<Store>, cooldown_ms: i64) -> (String, Arc<Mutex<Ve
         )),
         stream_usage_unsupported: Mutex::new(Default::default()),
         stats_retention_days: 730,
+        catalog_refresh_secs: 6 * 60 * 60,
     });
 
     let v1 = axum::Router::new()

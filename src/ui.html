@@ -16,7 +16,9 @@
   button.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
   button.danger:hover { background: #b62324; border-color: #b62324; }
   table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
-  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #21262d; }
+  .table-wrap { overflow-x: auto; max-width: 100%; }
+  .table-wrap table { min-width: 760px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #21262d; white-space: nowrap; }
   th { color: #8b949e; font-weight: 500; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; }
   .healthy { background: #12331f; color: #3fb950; }
@@ -54,7 +56,7 @@
       <h2 style="margin:0">Accounts</h2>
       <div class="row">
         <button onclick="startFlow()">Add account</button>
-        <button onclick="refreshCopilotCatalog()">Refresh Copilot catalog</button>
+        <button onclick="refreshCatalog()">Refresh models</button>
       </div>
     </div>
     <table id="accounts">
@@ -108,10 +110,10 @@
       <label><input id="groupKey" type="checkbox"> cache key</label>
     </div>
     <p id="usageTotals" class="muted"></p>
-    <table id="usageGroups"><thead><tr><th>model</th><th>account</th><th>cache key</th><th>requests</th><th>unknown</th><th>input</th><th>output</th></tr></thead><tbody></tbody></table>
+    <div class="table-wrap"><table id="usageGroups"><thead><tr><th>model</th><th>account</th><th>cache key</th><th>requests</th><th>unknown</th><th>input</th><th>output</th></tr></thead><tbody></tbody></table></div>
     <button id="usageMoreGroups" onclick="loadMoreUsageGroups()">More groups</button>
     <h2>Request details</h2>
-    <table id="usageDetails"><thead><tr><th>time</th><th>request id</th><th>model</th><th>account</th><th>cache key</th><th>status</th><th>input</th><th>output</th></tr></thead><tbody></tbody></table>
+    <div class="table-wrap"><table id="usageDetails"><thead><tr><th>time</th><th>request id</th><th>model</th><th>account</th><th>cache key</th><th>status</th><th>input</th><th>output</th></tr></thead><tbody></tbody></table></div>
     <button id="usageMore" onclick="loadMoreUsage()">More requests</button>
   </section>
 
@@ -193,6 +195,7 @@ let flowTimer = null;
 let usageOffset = 0;
 let usageGroupOffset = 0;
 let usageLoaded = false;
+let usageLoading = null;
 
 function token() { return localStorage.getItem('underclass_token') || ''; }
 function saveToken() {
@@ -280,12 +283,17 @@ function usageParams() {
 }
 
 async function loadUsage() {
-  usageOffset = 0;
-  usageGroupOffset = 0;
-  document.querySelector('#usageGroups tbody').innerHTML = '';
-  await loadMoreUsageGroups();
-  await loadMoreUsage();
-  usageLoaded = true;
+  if (usageLoading) return usageLoading;
+  usageLoading = (async () => {
+    usageOffset = 0;
+    usageGroupOffset = 0;
+    document.querySelector('#usageGroups tbody').innerHTML = '';
+    document.querySelector('#usageDetails tbody').innerHTML = '';
+    await loadMoreUsageGroups();
+    await loadMoreUsage();
+    usageLoaded = true;
+  })();
+  try { await usageLoading; } finally { usageLoading = null; }
 }
 
 async function loadMoreUsageGroups() {
@@ -528,6 +536,13 @@ async function useReset(id, force = false) {
 async function del(id) {
   if (!confirm('Remove this account from the pool?')) return;
   await api('/admin/api/accounts/' + id, { method: 'DELETE' });
+  loadState();
+}
+async function refreshCatalog() {
+  const res = await api('/admin/api/catalog/refresh', { method: 'POST' });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) alert('Model refresh failed: ' + (data.message || data.error || res.status));
+  else if (data.errors && data.errors.length) alert('Model refresh completed with errors:\n' + data.errors.join('\n'));
   loadState();
 }
 async function refreshCopilotCatalog() {

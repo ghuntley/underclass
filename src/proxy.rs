@@ -35,6 +35,7 @@ pub struct AppState {
     pub stream_usage_unsupported: Mutex<std::collections::HashSet<BackendId>>,
     /// How long usage rows, upstream events, and daily rollups are kept.
     pub stats_retention_days: i64,
+    pub catalog_refresh_secs: u64,
 }
 
 /// @cc [owner:ghuntley,label:accounting] stream-finish-recorded

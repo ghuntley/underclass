@@ -23,6 +23,8 @@ pub struct Flow {
     pub backend: BackendId,
     pub state: FlowState,
     pub replace_account: Option<String>,
+    #[serde(skip)]
+    catalog_refresh_pending: bool,
 }
 
 #[derive(Clone, Default)]
@@ -39,6 +41,7 @@ impl FlowRegistry {
                 backend,
                 state,
                 replace_account,
+                catalog_refresh_pending: true,
             },
         );
         id
@@ -46,6 +49,16 @@ impl FlowRegistry {
 
     pub fn get(&self, id: &str) -> Option<Flow> {
         self.inner.lock().unwrap().get(id).cloned()
+    }
+
+    pub fn take_catalog_refresh(&self, id: &str) -> bool {
+        let mut flows = self.inner.lock().unwrap();
+        let Some(flow) = flows.get_mut(id) else { return false; };
+        if !matches!(flow.state, FlowState::Authorized { .. }) || !flow.catalog_refresh_pending {
+            return false;
+        }
+        flow.catalog_refresh_pending = false;
+        true
     }
 
     pub fn set_state(&self, id: &str, state: FlowState) {
