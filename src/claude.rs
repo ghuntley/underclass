@@ -49,6 +49,8 @@ const IDENTITY_PREFIXES: [&str; 3] = [
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    #[error("secure randomness unavailable")]
+    Entropy,
     #[error("request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("unexpected status {0}")]
@@ -447,7 +449,7 @@ pub async fn manual_reset(
     else {
         return Err(ClaudeResetError::NoCredit);
     };
-    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_id = uuid::Uuid::now_v7().to_string();
     let body = consume_reset_credit(client, account, token, &credit.id, &request_id)
         .await
         .map_err(|_| ClaudeResetError::Upstream("consume"))?;
@@ -583,27 +585,21 @@ pub struct Pkce {
     pub state: String,
 }
 
-fn random_bytes(len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(len);
-    while out.len() < len {
-        out.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
-    }
-    out.truncate(len);
-    out
-}
-
 /// @cc [owner:ghuntley,label:auth] claude-pkce-challenge
 /// `new_pkce` MUST produce a verifier of at least 43 characters, a distinct random state, and a
-/// challenge that is the base64url-encoded SHA-256 of the verifier.
-pub fn new_pkce() -> Pkce {
-    let verifier = URL_SAFE_NO_PAD.encode(random_bytes(48));
-    let state = URL_SAFE_NO_PAD.encode(random_bytes(32));
+/// challenge that is the base64url-encoded SHA-256 of the verifier. Verifier and state
+/// MUST use independent OS-random bytes, with entropy failure preventing flow creation.
+pub fn new_pkce() -> Result<Pkce, AuthError> {
+    let verifier = URL_SAFE_NO_PAD
+        .encode(crate::randomness::random_bytes::<48>().map_err(|_| AuthError::Entropy)?);
+    let state = URL_SAFE_NO_PAD
+        .encode(crate::randomness::random_bytes::<32>().map_err(|_| AuthError::Entropy)?);
     let challenge = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
-    Pkce {
+    Ok(Pkce {
         verifier,
         challenge,
         state,
-    }
+    })
 }
 
 fn encode_component(value: &str) -> String {
@@ -978,7 +974,7 @@ pub async fn start_flow(
     flows: FlowRegistry,
     replace_account: Option<String>,
 ) -> Result<String, AuthError> {
-    let pkce = new_pkce();
+    let pkce = new_pkce()?;
     let url = authorize_url(&pkce);
     let flow_id = flows.create_with_oauth(
         BackendId::Claude,
@@ -1491,7 +1487,7 @@ mod tests {
 
     #[test]
     fn pkce_challenge_is_the_sha256_of_the_verifier() {
-        let pkce = new_pkce();
+        let pkce = new_pkce().unwrap();
         assert!(pkce.verifier.len() >= 43);
         assert_ne!(pkce.verifier, pkce.state);
         let expected = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(pkce.verifier.as_bytes()));
@@ -1500,7 +1496,7 @@ mod tests {
 
     #[test]
     fn authorize_url_carries_the_full_scope_set() {
-        let pkce = new_pkce();
+        let pkce = new_pkce().unwrap();
         let url = authorize_url(&pkce);
         assert!(url.starts_with(AUTHORIZE_URL));
         assert!(url.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"));

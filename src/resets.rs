@@ -594,7 +594,7 @@ impl ResetManager {
             }
         }
         if store.reset_attempt(&account.id).is_none() {
-            let id = uuid::Uuid::new_v4().to_string();
+            let id = uuid::Uuid::now_v7().to_string();
             store.save_reset_attempt(&account.id, &candidate.credit_id, &id);
         }
         let Some((credit_id, redemption_id, state)) = store.reset_attempt(&account.id) else {
@@ -726,7 +726,7 @@ impl ResetManager {
                 if previous.is_some() {
                     store.clear_reset_attempt(&account.id);
                 }
-                let redemption_id = uuid::Uuid::new_v4().to_string();
+                let redemption_id = uuid::Uuid::now_v7().to_string();
                 store.save_reset_attempt(&account.id, &credit.id, &redemption_id);
                 (credit.id, redemption_id)
             }

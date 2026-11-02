@@ -122,6 +122,23 @@ fn serve(bind_override: Option<String>) -> Result<(), Box<dyn std::error::Error>
     runtime.block_on(async_serve(bind_override))
 }
 
+fn load_or_mint_secret(
+    store: &store::Store,
+    configured: Option<&str>,
+    name: &str,
+    prefix: &str,
+) -> Result<String, rand::rngs::SysError> {
+    if let Some(value) = configured.filter(|value| !value.is_empty()) {
+        return Ok(value.to_string());
+    }
+    if let Some(value) = store.config_get(name) {
+        return Ok(value);
+    }
+    let value = format!("{prefix}{}", underclass::randomness::new_secret()?);
+    store.config_set(name, &value);
+    Ok(value)
+}
+
 /// @cc [owner:ghuntley,label:security] keys-minted-once
 /// The proxy API key and admin UI token MUST be minted on first run, persisted to the store, and
 /// reused on every subsequent start; an explicitly configured key/token MUST take precedence over
@@ -135,29 +152,13 @@ async fn async_serve(bind_override: Option<String>) -> Result<(), Box<dyn std::e
         pool::DEFAULT_BINDING_CAP,
     );
 
-    let proxy_key = match cfg.proxy_key.clone() {
-        Some(key) if !key.is_empty() => Some(key),
-        _ => match store.config_get("proxy_key") {
-            Some(key) => Some(key),
-            None => {
-                let key = format!("sk-underclass-{}", crate::models::new_id().replace('-', ""));
-                store.config_set("proxy_key", &key);
-                Some(key)
-            }
-        },
-    };
-
-    let ui_token = match cfg.ui_token.clone() {
-        Some(token) if !token.is_empty() => token,
-        _ => match store.config_get("ui_token") {
-            Some(token) => token,
-            None => {
-                let token = crate::models::new_id().replace('-', "");
-                store.config_set("ui_token", &token);
-                token
-            }
-        },
-    };
+    let proxy_key = Some(load_or_mint_secret(
+        &store,
+        cfg.proxy_key.as_deref(),
+        "proxy_key",
+        "sk-underclass-",
+    )?);
+    let ui_token = load_or_mint_secret(&store, cfg.ui_token.as_deref(), "ui_token", "")?;
 
     seed_catalog(&store, models::BackendId::Codex, codex::default_catalog());
     seed_catalog(
@@ -449,11 +450,34 @@ fn bind_monitor_socket(path: &Path) -> std::io::Result<tokio::net::UnixListener>
 mod monitor_socket_tests {
     use super::bind_monitor_socket;
 
+    #[test]
+    fn stored_and_configured_secrets_survive_id_migration() {
+        let store = underclass::store::Store::in_memory().unwrap();
+        let old = "sk-underclass-550e8400e29b41d4a716446655440000";
+        store.config_set("proxy_key", old);
+        assert_eq!(
+            super::load_or_mint_secret(&store, None, "proxy_key", "sk-underclass-").unwrap(),
+            old
+        );
+        assert_eq!(
+            super::load_or_mint_secret(&store, Some("explicit-key"), "proxy_key", "sk-underclass-")
+                .unwrap(),
+            "explicit-key"
+        );
+        assert_eq!(store.config_get("proxy_key").as_deref(), Some(old));
+        let minted = super::load_or_mint_secret(&store, None, "ui_token", "").unwrap();
+        assert_eq!(minted.len(), 43);
+        assert_eq!(
+            super::load_or_mint_secret(&store, None, "ui_token", "").unwrap(),
+            minted
+        );
+    }
+
     #[tokio::test]
     async fn keeps_live_socket_and_recovers_stale_socket() {
         // macOS expands std::env::temp_dir() to a long per-user path that can exceed SUN_LEN.
-        let dir = std::path::PathBuf::from("/tmp")
-            .join(format!("ucm-{}", &uuid::Uuid::new_v4().to_string()[..8]));
+        let dir =
+            std::path::PathBuf::from("/tmp").join(format!("ucm-{}", uuid::Uuid::now_v7().simple()));
         let path = dir.join("monitor.sock");
         let first = bind_monitor_socket(&path).unwrap();
         assert!(bind_monitor_socket(&path).is_err());

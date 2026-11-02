@@ -151,9 +151,13 @@ Accounting queries accept `from_ms` (inclusive), `to_ms` (exclusive), and exact 
 
 ### Correlation with preflight
 
-When [preflight](https://github.com/ghuntley/preflight) fronts underclass, it generates a UUIDv4 and forwards it as `x-request-id`. Underclass preserves that ID in its response, routing/retry logs, and request history. Search the same `request_id` in both services to trace inspection through pool routing.
+Clients send a UUIDv7 as `x-request-id`. Underclass preserves that ID in its response, routing/retry logs, and request history. Search the same `request_id` across the proxy chain to trace pool routing. Clients such as preflight must adopt UUIDv7 to retain correlation.
 
-Underclass accepts one hyphenated RFC4122 UUIDv4 and normalizes it to lowercase. Missing, duplicate, invalid, nil, and other-version IDs are replaced before authentication or logging. Every handled response receives the resulting ID, including 401s, 429s, model discovery, and unmatched routes. Provider responses cannot replace it. Correlation IDs convey no authorization or proof that preflight inspected a request. See [ADR 0012](docs/adr/0012-cross-proxy-request-correlation.md).
+Underclass accepts one hyphenated RFC9562 UUIDv7 and normalizes it to lowercase. Missing, duplicate, invalid, nil, UUIDv4, and other-version IDs are replaced before authentication or logging. Every handled response receives the resulting UUIDv7, including 401s, 429s, model discovery, and unmatched routes. Provider responses cannot replace it. Correlation IDs convey no authorization or proof that another proxy inspected a request. See [ADR 0027](docs/adr/0027-uuidv7-identities-and-secret-randomness.md).
+
+New account, flow, and redemption identifiers also use UUIDv7. Existing account identifiers, pending redemption IDs, stored credentials, and history remain unchanged. New proxy/admin secrets and OAuth PKCE material use independent operating-system randomness, never UUID bytes.
+
+An exhausted chain of proven `server_is_overloaded` Responses stream failures may carry `x-underclass-retry-safe: pre-output-overload`. Underclass issues this only when every attempt failed before output and every observed event supports that conclusion. Generic failures, malformed/unknown events, output, transport loss, and other error codes prevent certification. Saved upstream error bodies carry no independent retry authority. The certificate requires a trusted authenticated connection to Underclass; it does not authorize unbounded retries or replay of ambiguous requests. See [ADR 0028](docs/adr/0028-proven-overload-retry-certificate.md).
 
 ## Models
 

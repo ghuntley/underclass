@@ -1,3 +1,4 @@
+use crate::correlation::RequestId;
 use crate::logging;
 use crate::models::{AccountStatus, BackendId, Outcome, RequestLogEntry, Surface, now_ms};
 use crate::pool::{Decision, PoolCore, SelectError, Selection};
@@ -16,7 +17,6 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tower_http::request_id::RequestId;
 
 pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const LOG_BUFFER: usize = 200;
@@ -48,6 +48,7 @@ const STRIPPED_CLIENT_HEADERS: &[&str] = &[
     "x-forwarded-host",
     "x-forwarded-proto",
     "x-request-id",
+    "x-underclass-retry-safe",
 ];
 
 pub struct AppState {
@@ -313,11 +314,51 @@ fn saturated_response(until_ms: i64) -> Response {
     resp
 }
 
-fn attach_request_id(mut resp: Response, request_id: &str) -> Response {
+const RETRY_SAFE_HEADER: &str = "x-underclass-retry-safe";
+const RETRY_SAFE_VALUE: &str = "pre-output-overload";
+
+#[derive(Default)]
+struct RetryProof {
+    saw_overload: bool,
+    disqualified: bool,
+}
+
+impl RetryProof {
+    fn overload(&mut self, proven: bool) {
+        self.saw_overload = true;
+        self.disqualified |= !proven;
+    }
+
+    fn disqualify(&mut self) {
+        self.disqualified = true;
+    }
+
+    fn certified(&self) -> bool {
+        self.saw_overload && !self.disqualified
+    }
+}
+
+/// @cc [owner:ghuntley,label:proxy;security] retry-certificate-finalization
+/// Only this finalizer MAY attach the retry certificate, and only when every
+/// attempted inference proved the exact server_is_overloaded failure before
+/// output. Any generic failover permanently disqualifies the request. External
+/// headers and saved responses MUST NOT carry independent retry authority.
+fn finish_response(mut resp: Response, request_id: &str, retry_safe: bool) -> Response {
+    resp.headers_mut().remove(RETRY_SAFE_HEADER);
+    if retry_safe {
+        resp.headers_mut().insert(
+            RETRY_SAFE_HEADER,
+            http::HeaderValue::from_static(RETRY_SAFE_VALUE),
+        );
+    }
     if let Ok(v) = http::HeaderValue::from_str(request_id) {
         resp.headers_mut().insert("x-request-id", v);
     }
     resp
+}
+
+fn attach_request_id(resp: Response, request_id: &str) -> Response {
+    finish_response(resp, request_id, false)
 }
 
 enum Attempt {
@@ -328,6 +369,7 @@ enum Attempt {
     Overloaded {
         account_id: String,
         replay: Response,
+        retry_safe: bool,
     },
 }
 
@@ -393,7 +435,8 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
             .unwrap_or_else(|| path.clone()),
         Surface::OpenAI => path.clone(),
     };
-    let client_headers = req.headers().clone();
+    let mut client_headers = req.headers().clone();
+    client_headers.remove(RETRY_SAFE_HEADER);
     let session_header = client_headers
         .get("session-id")
         .and_then(|v| v.to_str().ok())
@@ -455,6 +498,7 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
 
     let total_accounts = state.pool.lock().unwrap().accounts.len().max(1);
     let mut last_upstream: Option<Response> = None;
+    let mut retry_proof = RetryProof::default();
     let mut refreshed: std::collections::HashSet<String> = Default::default();
     let mut reset_after_quota = false;
     let mut attempts = 0;
@@ -481,7 +525,7 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
                 replay.status().as_u16(),
                 started.elapsed().as_millis() as u64,
             );
-            return attach_request_id(replay, &request_id);
+            return finish_response(replay, &request_id, retry_proof.certified());
         }
 
         if matches!(selection, Err(SelectError::Saturated { .. })) && !reset_after_quota {
@@ -508,7 +552,7 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
                 return attach_request_id(saturated_response(until_ms), &request_id);
             }
             Err(SelectError::NoAccounts) => {
-                return attach_request_id(
+                return finish_response(
                     last_upstream.take().unwrap_or_else(|| {
                         error_response(
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -517,6 +561,7 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
                         )
                     }),
                     &request_id,
+                    retry_proof.certified(),
                 );
             }
         };
@@ -572,13 +617,19 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
                     resp.status().as_u16(),
                     started.elapsed().as_millis() as u64,
                 );
-                return resp;
+                return finish_response(resp, &request_id, false);
             }
-            Attempt::Overloaded { account_id, replay } => {
+            Attempt::Overloaded {
+                account_id,
+                replay,
+                retry_safe,
+            } => {
+                retry_proof.overload(retry_safe);
                 overloaded.insert(account_id);
                 last_upstream = Some(replay);
             }
             Attempt::Failover(passthrough) => {
+                retry_proof.disqualify();
                 last_upstream = passthrough.or(last_upstream);
                 if attempts == max_attempts && !reset_after_quota {
                     reset_after_quota = true;
@@ -604,7 +655,7 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
         return attach_request_id(saturated_response(until_ms), &request_id);
     }
 
-    attach_request_id(
+    finish_response(
         last_upstream.take().unwrap_or_else(|| {
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -613,6 +664,7 @@ async fn run(state: Arc<AppState>, req: Request, surface: Surface) -> Response {
             )
         }),
         &request_id,
+        retry_proof.certified(),
     )
 }
 
@@ -640,6 +692,7 @@ async fn attempt_account(
 ) -> Attempt {
     let started = Instant::now();
     let started_ms = now_ms();
+    let mut retry_safe = true;
     let Some(backend) = state.backends.get(&selection.backend).cloned() else {
         return Attempt::Failover(None);
     };
@@ -748,6 +801,7 @@ async fn attempt_account(
         let status = response.status();
         let rejection = response.text().await.unwrap_or_default();
         if rejection.contains("stream_options") || rejection.contains("include_usage") {
+            retry_safe = false;
             let rejected = usage_record(
                 request_id,
                 endpoint,
@@ -1029,6 +1083,7 @@ async fn attempt_account(
                 status_code.as_u16(),
                 started.elapsed().as_millis() as u64,
             );
+            retry_safe &= finish.tap.retry_safe_overload();
             finish.ended.get_or_insert(StreamEnd::Eof);
             finish.detail = "stream_failover";
             // Dropping `finish` persists the failed attempt and its `overloaded` event.
@@ -1044,6 +1099,7 @@ async fn attempt_account(
             return Attempt::Overloaded {
                 account_id: selection.account_id.clone(),
                 replay,
+                retry_safe,
             };
         }
         let body_stream = Body::from_stream(futures::stream::unfold(
@@ -1286,6 +1342,44 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[hegel::test]
+    fn retry_proof_cannot_recover_after_an_uncertain_attempt(tc: hegel::TestCase) {
+        use hegel::generators as gs;
+        let attempts: Vec<u8> =
+            tc.draw(gs::vecs(gs::integers::<u8>().min_value(0).max_value(2)).max_size(50));
+        let mut proof = RetryProof::default();
+        for attempt in &attempts {
+            match attempt {
+                0 => proof.overload(true),
+                1 => proof.overload(false),
+                _ => proof.disqualify(),
+            }
+        }
+        assert_eq!(
+            proof.certified(),
+            !attempts.is_empty() && attempts.iter().all(|attempt| *attempt == 0)
+        );
+    }
+
+    #[test]
+    fn finalizer_removes_forged_and_stale_certificates() {
+        let mut response = Response::new(Body::empty());
+        response.headers_mut().append(
+            RETRY_SAFE_HEADER,
+            http::HeaderValue::from_static(RETRY_SAFE_VALUE),
+        );
+        response
+            .headers_mut()
+            .append(RETRY_SAFE_HEADER, http::HeaderValue::from_static("forged"));
+        let response = finish_response(response, "019a45b7-0000-7000-8000-000000000001", true);
+        assert_eq!(
+            response.headers().get_all(RETRY_SAFE_HEADER).iter().count(),
+            1
+        );
+        let response = finish_response(response, "019a45b7-0000-7000-8000-000000000001", false);
+        assert!(!response.headers().contains_key(RETRY_SAFE_HEADER));
+    }
 
     #[test]
     fn sticky_key_from_body_cache_key() {

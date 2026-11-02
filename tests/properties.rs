@@ -1114,3 +1114,92 @@ fn test_model_cooldown_scopes_one_model(tc: TestCase) {
         "the cooldown expires on its own"
     );
 }
+
+/// Chunk boundaries must not change the proof, and uncertain earlier data cannot
+/// be erased by a subsequent well-formed overload event.
+#[hegel::test]
+fn retry_certificate_requires_an_entire_known_output_free_prefix(tc: TestCase) {
+    let variant = tc.draw(gs::integers::<u8>().min_value(0).max_value(10));
+    let chunk_size = tc.draw(gs::integers::<usize>().min_value(1).max_value(113));
+    let prefix = match variant {
+        0 => {
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"output\":[]}}\n\n"
+        }
+        1 => "data: {broken\n\n",
+        2 => "data: {\"type\":\"future.output\"}\n\n",
+        3 => "data: {\"type\":\"response.output_text.delta\",\"delta\":\"text\"}\n\n",
+        4 => {
+            "data: {\"type\":\"response.created\",\"response\":{\"output\":[{\"type\":\"function_call\"}]}}\n\n"
+        }
+        5 => "data: {\"type\":\"response.completed\"}\n\n",
+        6 => "event: response.output_text.delta\ndata: {\"type\":\"response.created\"}\n\n",
+        7 => "data: {\"type\":\"error\",\"code\":\"server_error\"}\n\n",
+        8 => "data: {\"type\":\"response.created\",\"response\":null}\n\n",
+        9 => {
+            "data: {\"type\":\"response.created\",\"response\":{\"usage\":{\"output_tokens\":1}}}\n\n"
+        }
+        _ => "data: {\"type\":\"response.created\",\"response\":{\"usage\":\"unreadable\"}}\n\n",
+    };
+    let body = format!(
+        "{prefix}event: error\ndata: {{\"type\":\"error\",\"error\":{{\"code\":\"server_is_overloaded\"}}}}\n\n"
+    );
+    let mut tap = UsageTap::new(true, UsageDialect::Responses);
+    for chunk in body.as_bytes().chunks(chunk_size) {
+        tap.feed(chunk);
+    }
+    assert_eq!(tap.retry_safe_overload(), variant == 0);
+}
+
+#[hegel::test]
+fn retry_certificate_requires_exact_unsanitized_code(tc: TestCase) {
+    let extra: String = tc.draw(gs::text().min_size(1).max_size(30));
+    let raw = format!("server_is_overloaded{extra}");
+    let body = format!(
+        "data: {}\n\n",
+        serde_json::json!({"type":"error","code":raw})
+    );
+    let mut tap = UsageTap::new(true, UsageDialect::Responses);
+    tap.feed(body.as_bytes());
+    assert!(!tap.retry_safe_overload());
+}
+
+#[test]
+fn retry_certificate_does_not_recover_after_overflow_or_partial_output() {
+    let mut tap = UsageTap::new(true, UsageDialect::Responses);
+    let oversized = format!("data: {}\n\n", "x".repeat(1_048_577));
+    tap.feed(oversized.as_bytes());
+    let overload = b"data: {\"type\":\"error\",\"code\":\"server_is_overloaded\"}\n\n";
+    tap.feed(overload);
+    assert!(!tap.retry_safe_overload());
+
+    let mut partial = UsageTap::new(true, UsageDialect::Responses);
+    partial.feed(overload);
+    assert!(partial.retry_safe_overload());
+    partial.feed(b"data: {\"type\":\"response.output_text.delta\"");
+    assert!(!partial.retry_safe_overload());
+}
+
+#[test]
+fn uuidv7_generation_preserves_legacy_account_and_redemption_lookups() {
+    let store = Store::in_memory().unwrap();
+    let mut account = underclass::flows::new_account(BackendId::Codex, "legacy".to_string());
+    assert_eq!(
+        uuid::Uuid::parse_str(&account.id).unwrap().get_version(),
+        Some(uuid::Version::SortRand)
+    );
+    account.id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+    store.upsert_account(&account);
+    let redemption = "9e45fade-954c-4bbe-ad68-f52bb9e97de9";
+    store.save_reset_attempt(&account.id, "old-credit", redemption);
+    assert_eq!(store.get_account(&account.id).unwrap().id, account.id);
+    assert_eq!(store.reset_attempt(&account.id).unwrap().1, redemption);
+}
+
+#[test]
+fn accepted_anthropic_stream_is_not_replayed_even_with_same_chunk_error() {
+    let mut tap = UsageTap::new(true, UsageDialect::Anthropic);
+    tap.feed(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\"}}\n\n");
+    assert!(tap.decided());
+    assert_eq!(tap.overload_before_output(), None);
+    assert!(!tap.retry_safe_overload());
+}

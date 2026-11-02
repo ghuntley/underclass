@@ -1094,7 +1094,7 @@ mod tests {
     #[test]
     fn opening_a_legacy_store_adds_the_rotation_column_without_losing_rows() {
         let path =
-            std::env::temp_dir().join(format!("underclass-legacy-{}.db", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("underclass-legacy-{}.db", uuid::Uuid::now_v7()));
         {
             // Recreate the pre-migration accounts table exactly as it shipped.
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -1187,7 +1187,7 @@ mod tests {
     #[test]
     fn usage_survives_reopen_and_splits_unknown_from_measured() {
         let path =
-            std::env::temp_dir().join(format!("underclass-usage-{}.db", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("underclass-usage-{}.db", uuid::Uuid::now_v7()));
         {
             let store = Store::open(&path).unwrap();
             for (key, input) in [
@@ -1198,7 +1198,7 @@ mod tests {
                 store
                     .insert_usage(&UsageRecord {
                         id: 0,
-                        request_id: uuid::Uuid::new_v4().to_string(),
+                        request_id: uuid::Uuid::now_v7().to_string(),
                         ts: 100,
                         endpoint: "/v1/responses".into(),
                         backend: "codex".into(),

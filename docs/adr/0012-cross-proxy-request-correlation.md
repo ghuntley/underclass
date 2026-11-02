@@ -1,7 +1,7 @@
 # 0012 — Validated request correlation with preflight
 
 ## Status
-Accepted
+Superseded by [0027](0027-uuidv7-identities-and-secret-randomness.md).
 
 ## Context
 Preflight and underclass need a common identity for inspection, routing, retries,

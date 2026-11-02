@@ -13,6 +13,7 @@ pub mod monitor;
 pub mod pool;
 pub mod provider;
 pub mod proxy;
+pub mod randomness;
 pub mod resets;
 pub mod stats;
 pub mod stats_api;

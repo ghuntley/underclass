@@ -224,8 +224,11 @@ pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 
+/// @cc [owner:ghuntley,label:identity] new-identifiers-uuidv7
+/// Newly generated account and flow identifiers MUST be UUIDv7. Stored identifiers
+/// remain opaque and MUST NOT be rewritten or used as secret randomness.
 pub fn new_id() -> String {
-    uuid::Uuid::new_v4().to_string()
+    uuid::Uuid::now_v7().to_string()
 }
 
 #[cfg(test)]

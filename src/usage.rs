@@ -116,6 +116,13 @@ pub fn sanitize_code(raw: &str) -> Option<String> {
     (!code.is_empty()).then_some(code)
 }
 
+fn raw_error_code(error: &Value) -> Option<&str> {
+    error
+        .get("code")
+        .and_then(Value::as_str)
+        .or_else(|| error.get("type").and_then(Value::as_str))
+}
+
 /// Extracts `code`, falling back to `type`, from an upstream error object.
 pub fn error_code(error: &Value) -> Option<String> {
     error
@@ -206,6 +213,10 @@ pub struct UsageTap {
     saw_output: bool,
     /// The upstream accepted the request, so it must not be replayed on another account.
     committed: bool,
+    /// Unlike accounting's sanitized classifications, retry authority requires an
+    /// exact raw overload code and a fully understood prefix with no output.
+    retry_prefix_proven: bool,
+    retry_terminal_proven: bool,
 }
 
 impl UsageTap {
@@ -223,6 +234,8 @@ impl UsageTap {
             terminal: None,
             saw_output: false,
             committed: false,
+            retry_prefix_proven: stream && dialect == UsageDialect::Responses,
+            retry_terminal_proven: false,
         }
     }
 
@@ -290,6 +303,7 @@ impl UsageTap {
         } else {
             serde_json::from_slice::<Value>(&self.event_data).ok()
         };
+        self.observe_retry_evidence(parsed.as_ref());
         match self.dialect {
             UsageDialect::Chat => self.finish_chat_event(parsed),
             UsageDialect::Responses => self.finish_responses_event(parsed),
@@ -298,6 +312,90 @@ impl UsageTap {
         self.event_data.clear();
         self.event_name = None;
         self.overflow = false;
+    }
+
+    fn observe_retry_evidence(&mut self, parsed: Option<&Value>) {
+        if !self.retry_prefix_proven {
+            return;
+        }
+        // Empty SSE keepalives have no data. Malformed/oversized or unknown data
+        // may hide output, and that uncertainty cannot be repaired by a later error.
+        if !self.overflow && self.event_data.is_empty() && self.event_name.is_none() {
+            return;
+        }
+        let Some(value) = parsed.filter(|v| v.is_object()) else {
+            self.retry_prefix_proven = false;
+            return;
+        };
+        let kind = value.get("type").and_then(Value::as_str);
+        if self.overflow
+            || self.terminal.is_some()
+            || self
+                .event_name
+                .as_deref()
+                .is_some_and(|name| Some(name) != kind)
+        {
+            self.retry_prefix_proven = false;
+            return;
+        }
+        let response = value.get("response");
+        let output_present = [Some(value), response].into_iter().flatten().any(|body| {
+            !body.is_object()
+                || body
+                    .get("output")
+                    .is_some_and(|output| output.as_array().is_none_or(|items| !items.is_empty()))
+                || body
+                    .get("output_text")
+                    .is_some_and(|text| text.as_str() != Some(""))
+                || body.get("usage").is_some_and(|usage| {
+                    !usage.is_null()
+                        && (!usage.is_object()
+                            || usage
+                                .get("output_tokens")
+                                .is_some_and(|count| count.as_u64() != Some(0)))
+                })
+                || ["delta", "choices", "tool_calls", "content"]
+                    .iter()
+                    .any(|key| body.get(*key).is_some())
+        });
+        if output_present {
+            self.retry_prefix_proven = false;
+            return;
+        }
+        match kind {
+            Some("response.created" | "response.in_progress" | "response.queued") => {}
+            Some("error") => {
+                let raw_code = value
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .or_else(|| value.get("error").and_then(raw_error_code))
+                    .or_else(|| raw_error_code(value));
+                self.retry_terminal_proven = raw_code == Some("server_is_overloaded");
+            }
+            Some("response.failed") => {
+                self.retry_terminal_proven = response
+                    .and_then(|body| body.get("error"))
+                    .and_then(raw_error_code)
+                    == Some("server_is_overloaded");
+            }
+            _ => self.retry_prefix_proven = false,
+        }
+    }
+
+    /// @cc [owner:ghuntley,label:proxy;security] exact-overload-output-proof
+    /// Retry authority MUST require the exact raw server_is_overloaded code and
+    /// a complete parsed Responses prefix containing no output. Malformed,
+    /// oversized, unknown or output-bearing events permanently invalidate proof;
+    /// partial trailing events, other dialects and committed responses never qualify.
+    pub fn retry_safe_overload(&self) -> bool {
+        self.retry_prefix_proven
+            && self.retry_terminal_proven
+            && !self.committed
+            && !self.overflow
+            && self.buffer.is_empty()
+            && self.event_data.is_empty()
+            && self.event_name.is_none()
+            && self.overload_before_output() == Some("server_is_overloaded")
     }
 
     fn finish_chat_event(&mut self, parsed: Option<Value>) {
@@ -489,7 +587,7 @@ impl UsageTap {
     pub fn overload_before_output(&self) -> Option<&str> {
         match &self.terminal {
             Some((StreamOutcome::Failed, Some(code)))
-                if !self.saw_output && is_overload_code(code) =>
+                if !self.saw_output && !self.committed && is_overload_code(code) =>
             {
                 Some(code)
             }

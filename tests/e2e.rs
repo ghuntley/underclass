@@ -34,6 +34,10 @@ async fn mock_responses(
     uri: axum::http::Uri,
     body: String,
 ) -> Response {
+    assert!(
+        !headers.contains_key("x-underclass-retry-safe"),
+        "client retry authority must not reach upstream"
+    );
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -213,6 +217,54 @@ async fn mock_responses(
             [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
             "event: response.created\ndata: {\"type\":\"response.created\"}\n\nevent: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}}\n\n",
         ).into_response();
+    }
+    if let Some(case) = bearer.strip_prefix("tok-proof-") {
+        let overload = "data: {\"type\":\"error\",\"code\":\"server_is_overloaded\"}\n\n";
+        let (status, payload) = match case {
+            "malformed" => (200, format!("data: {{invalid\n\n{overload}")),
+            "unknown" => (
+                200,
+                format!("data: {{\"type\":\"future.event\"}}\n\n{overload}"),
+            ),
+            "tool" => (
+                200,
+                format!(
+                    "data: {{\"type\":\"response.output_item.added\",\"item\":{{\"type\":\"function_call\"}}}}\n\n{overload}"
+                ),
+            ),
+            "http" => (
+                503,
+                "{\"error\":{\"code\":\"server_is_overloaded\"}}".to_string(),
+            ),
+            "policy" => (
+                200,
+                "data: {\"type\":\"error\",\"code\":\"cyber_policy\"}\n\n".to_string(),
+            ),
+            "quota" => (
+                200,
+                "data: {\"type\":\"error\",\"code\":\"usage_limit_reached\"}\n\n".to_string(),
+            ),
+            "broad" => (
+                200,
+                "data: {\"type\":\"error\",\"code\":\"overloaded_error\"}\n\n".to_string(),
+            ),
+            "sanitized" => (
+                200,
+                "data: {\"type\":\"error\",\"code\":\"server_is_overloaded!\"}\n\n".to_string(),
+            ),
+            "truncated" => (200, "data: {\"type\":\"response.created\"}\n\n".to_string()),
+            "success" => (
+                200,
+                "data: {\"type\":\"response.completed\"}\n\n".to_string(),
+            ),
+            _ => (200, overload.to_string()),
+        };
+        return Response::builder()
+            .status(status)
+            .header("content-type", "text/event-stream")
+            .header("x-underclass-retry-safe", "pre-output-overload")
+            .body(Body::from(payload))
+            .unwrap();
     }
     if bearer.starts_with("tok-ovl-") && wants_stream {
         // The shape Codex upstream sends today: a 200 stream, a pause, then a stream `error` event
@@ -397,10 +449,18 @@ async fn spawn_app(
     store: Arc<Store>,
     cooldown_ms: i64,
 ) -> (String, Arc<Mutex<VecDeque<RequestLogEntry>>>) {
+    spawn_app_with_codex(store, cooldown_ms, Arc::new(CodexBackend { cooldown_ms })).await
+}
+
+async fn spawn_app_with_codex(
+    store: Arc<Store>,
+    cooldown_ms: i64,
+    codex: Arc<dyn underclass::provider::Backend>,
+) -> (String, Arc<Mutex<VecDeque<RequestLogEntry>>>) {
     let client = reqwest::Client::new();
     let tokens = Arc::new(TokenManager::new(store.clone(), client.clone()));
     let mut backends: BackendMap = std::collections::HashMap::new();
-    backends.insert(BackendId::Codex, Arc::new(CodexBackend { cooldown_ms }));
+    backends.insert(BackendId::Codex, codex);
     backends.insert(BackendId::Copilot, Arc::new(CopilotBackend { cooldown_ms }));
     backends.insert(BackendId::Claude, Arc::new(ClaudeBackend { cooldown_ms }));
     let core = PoolCore::new(&store, backend_surfaces(&backends));
@@ -603,7 +663,7 @@ async fn e2e_full_pool_story() {
             if let Some(k) = &key {
                 body["prompt_cache_key"] = serde_json::Value::String(k.clone());
             }
-            let request_id = uuid::Uuid::new_v4().to_string();
+            let request_id = uuid::Uuid::now_v7().to_string();
             let response = http
                 .post(format!("{base}/v1/responses"))
                 .header("Authorization", "Bearer test-key")
@@ -1519,4 +1579,141 @@ async fn e2e_anthropic_messages_alias_serves_the_same_surface() {
         .iter()
         .any(|token| token == "claude-alias-token");
     assert!(served, "the alias reached the upstream");
+}
+
+async fn retry_response(base: &str) -> reqwest::Response {
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/responses"))
+        .header("Authorization", "Bearer test-key")
+        .header("x-request-id", &request_id)
+        .header("x-underclass-retry-safe", "pre-output-overload")
+        .json(&serde_json::json!({"model":"gpt-5.5","input":"hi","stream":true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.headers()["x-request-id"], request_id);
+    response
+}
+
+#[tokio::test]
+async fn e2e_retry_certificate_covers_all_and_only_proven_overload_chains() {
+    mock_upstream();
+    for (tokens, expected) in [
+        (vec!["tok-proof-exact"], true),
+        (vec!["tok-ovl-first", "tok-ovl-second"], true),
+        (vec!["tok-proof-malformed"], false),
+        (vec!["tok-proof-unknown"], false),
+        (vec!["tok-proof-tool"], false),
+        (vec!["tok-proof-http"], false),
+        (vec!["tok-proof-policy"], false),
+        (vec!["tok-proof-quota"], false),
+        (vec!["tok-proof-broad"], false),
+        (vec!["tok-proof-sanitized"], false),
+        (vec!["tok-proof-truncated"], false),
+        (vec!["tok-proof-success"], false),
+        (vec!["tok-ovl-first", "tok-proof-success"], false),
+        (vec!["tok-proof-http", "tok-ovl-second"], false),
+        (vec!["tok-ovl-first", "tok-proof-http"], false),
+        (vec!["missing-credential", "tok-ovl-second"], false),
+        (vec!["tok-ovl-first", "missing-credential"], false),
+        (vec!["tok-late-ovl-first", "tok-proof-exact"], false),
+    ] {
+        let store = Arc::new(Store::in_memory().unwrap());
+        store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+        for (index, token) in tokens.iter().enumerate() {
+            let mut account = codex_account(&format!("proof-{index}"), token);
+            if *token == "missing-credential" {
+                account.access_token = None;
+                account.refresh_token = None;
+            }
+            store.upsert_account(&account);
+        }
+        let (base, _) = spawn_app(store.clone(), 400).await;
+        let response = retry_response(&base).await;
+        assert_eq!(
+            response
+                .headers()
+                .get("x-underclass-retry-safe")
+                .map(|v| v.to_str().unwrap()),
+            expected.then_some("pre-output-overload"),
+            "chain: {tokens:?}"
+        );
+        let body = response.text().await.unwrap();
+        if expected {
+            assert!(body.contains("server_is_overloaded"));
+            assert_eq!(
+                wait_for_rows(&store, tokens.len()).await.len(),
+                tokens.len()
+            );
+        }
+    }
+}
+
+struct DisconnectedCodex {
+    inner: CodexBackend,
+    address: std::net::SocketAddr,
+}
+
+impl underclass::provider::Backend for DisconnectedCodex {
+    fn id(&self) -> BackendId {
+        BackendId::Codex
+    }
+    fn surfaces(&self) -> &'static [Surface] {
+        &[Surface::OpenAI]
+    }
+    fn default_cooldown_ms(&self) -> i64 {
+        self.inner.default_cooldown_ms()
+    }
+    fn rewrite_url(&self, path: &str, account: &Account) -> String {
+        if account.access_token.as_deref() == Some("disconnect") {
+            format!("http://{}{path}", self.address)
+        } else {
+            self.inner.rewrite_url(path, account)
+        }
+    }
+    fn inject_headers(
+        &self,
+        account: &Account,
+        token: &str,
+        sticky: Option<&str>,
+        body: &serde_json::Value,
+        client: &http::HeaderMap,
+        headers: &mut http::HeaderMap,
+    ) {
+        self.inner
+            .inject_headers(account, token, sticky, body, client, headers);
+    }
+}
+
+#[tokio::test]
+async fn e2e_saved_overload_cannot_certify_a_later_transport_failure() {
+    mock_upstream();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let store = Arc::new(Store::in_memory().unwrap());
+    store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+    store.upsert_account(&codex_account("transport-a", "tok-ovl-transport"));
+    store.upsert_account(&codex_account("transport-b", "disconnect"));
+    let backend = Arc::new(DisconnectedCodex {
+        inner: CodexBackend { cooldown_ms: 400 },
+        address,
+    });
+    let (base, _) = spawn_app_with_codex(store.clone(), 400, backend).await;
+    let response = retry_response(&base).await;
+    assert!(!response.headers().contains_key("x-underclass-retry-safe"));
+    assert!(
+        response
+            .text()
+            .await
+            .unwrap()
+            .contains("server_is_overloaded")
+    );
+    let rows = wait_for_rows(&store, 2).await;
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter()
+            .any(|row| row.account_id == "transport-b" && row.status == 0)
+    );
 }
