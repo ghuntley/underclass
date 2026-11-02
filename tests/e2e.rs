@@ -28,6 +28,14 @@ struct MockState {
     forbidden: std::collections::HashMap<String, u32>,
 }
 
+const MEDIA_SUCCESS: &str = concat!(
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"A fixture joke.\"}]}]}}\n\n"
+);
+const MEDIA_OVERLOAD: &str = "data: {\"type\":\"error\",\"code\":\"server_is_overloaded\"}\n\n";
+const MEDIA_JSON: &str = "{\"status\":\"completed\",\"output\":[]}";
+const MEDIA_HTTP_ERROR: &str = "{\"error\":{\"code\":\"upstream_error\"}}";
+
 async fn mock_responses(
     State(state): State<Arc<Mutex<MockState>>>,
     headers: axum::http::HeaderMap,
@@ -156,6 +164,20 @@ async fn mock_responses(
     }
 
     state.lock().unwrap().served_by.push_back(bearer.clone());
+    if let Some(case) = bearer.strip_prefix("tok-media-") {
+        let (status, payload) = match case {
+            "success-json" | "success-missing" => (200, MEDIA_SUCCESS),
+            "overload-json" | "overload-missing" => (200, MEDIA_OVERLOAD),
+            "json" => (200, MEDIA_JSON),
+            "http-error" => (503, MEDIA_HTTP_ERROR),
+            _ => panic!("unknown media fixture"),
+        };
+        let mut response = Response::builder().status(status);
+        if !case.ends_with("-missing") {
+            response = response.header("content-type", "application/json");
+        }
+        return response.body(Body::from(payload)).unwrap();
+    }
     if uri.path().ends_with("/messages") {
         // Echo what the Anthropic upstream received, so the test can assert the credential
         // swap, the forwarded client headers, and the verbatim body.
@@ -1594,6 +1616,93 @@ async fn retry_response(base: &str) -> reqwest::Response {
         .unwrap();
     assert_eq!(response.headers()["x-request-id"], request_id);
     response
+}
+
+/// @cc [owner:ghuntley,label:verification;proxy] streamed-media-type-http-regression
+/// The real proxy HTTP boundary MUST label requested SSE correctly even when
+/// upstream supplies application/json or no media type. Success and certified
+/// overload replay MUST retain exact bytes and correlation; non-stream JSON
+/// and HTTP failures MUST retain their media types without retry authority.
+#[tokio::test]
+async fn e2e_stream_media_type_matches_live_and_replayed_bytes() {
+    mock_upstream();
+    for (case, streaming, status, media_type, payload, certified) in [
+        (
+            "success-json",
+            true,
+            200,
+            "text/event-stream",
+            MEDIA_SUCCESS,
+            false,
+        ),
+        (
+            "success-missing",
+            true,
+            200,
+            "text/event-stream",
+            MEDIA_SUCCESS,
+            false,
+        ),
+        (
+            "overload-json",
+            true,
+            200,
+            "text/event-stream",
+            MEDIA_OVERLOAD,
+            true,
+        ),
+        (
+            "overload-missing",
+            true,
+            200,
+            "text/event-stream",
+            MEDIA_OVERLOAD,
+            true,
+        ),
+        ("json", false, 200, "application/json", MEDIA_JSON, false),
+        (
+            "http-error",
+            true,
+            503,
+            "application/json",
+            MEDIA_HTTP_ERROR,
+            false,
+        ),
+    ] {
+        let store = Arc::new(Store::in_memory().unwrap());
+        store.set_catalog(BackendId::Codex, &[model("gpt-5.5")]);
+        store.upsert_account(&codex_account("media-type", &format!("tok-media-{case}")));
+        let (base, _) = spawn_app(store, 400).await;
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let response = reqwest::Client::new()
+            .post(format!("{base}/v1/responses"))
+            .header("Authorization", "Bearer test-key")
+            .header("x-request-id", &request_id)
+            .json(&serde_json::json!({"model":"gpt-5.5","input":"hi","stream":streaming}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "case: {case}");
+        assert_eq!(
+            response.headers()["content-type"],
+            media_type,
+            "case: {case}"
+        );
+        assert_eq!(
+            response.headers()["x-request-id"],
+            request_id,
+            "case: {case}"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-underclass-retry-safe")
+                .map(|value| value.to_str().unwrap()),
+            certified.then_some("pre-output-overload"),
+            "case: {case}"
+        );
+        assert_eq!(response.text().await.unwrap(), payload, "case: {case}");
+    }
 }
 
 #[tokio::test]

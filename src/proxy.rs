@@ -222,6 +222,12 @@ pub fn extract_sticky_key(body: &Value, session_header: Option<&str>) -> Option<
         .filter(|s| !s.is_empty())
 }
 
+/// @cc [owner:ghuntley,label:proxy] successful-stream-media-type
+/// A successful response classified as streaming by the outbound request or
+/// upstream media type MUST be published as text/event-stream, for both live
+/// forwarding and held replay. Missing or incorrect upstream JSON headers MUST
+/// NOT make clients parse SSE as JSON. Non-stream responses and HTTP errors
+/// retain their upstream media type and every response retains its body bytes.
 fn usage_is_stream(body: &Value, content_type: &[u8]) -> bool {
     body.get("stream").and_then(Value::as_bool) == Some(true)
         || content_type.starts_with(b"text/event-stream")
@@ -1041,6 +1047,11 @@ async fn attempt_account(
             .unwrap_or(http::HeaderValue::from_static("application/json"));
         let status_code = status;
         let is_stream = usage_is_stream(&outbound_body, content_type.as_bytes());
+        let content_type = if is_stream {
+            http::HeaderValue::from_static("text/event-stream")
+        } else {
+            content_type
+        };
         let mut stream = response.bytes_stream();
         let mut finish = UsageFinish {
             store: state.store.clone(),

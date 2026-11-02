@@ -31,3 +31,23 @@ ADR 0021 also mis-recorded these failures. It took the error code from a stream 
 - Streamed responses now reach the client at the first output event, not at the first upstream byte. For a client this only moves when the response headers arrive; the first token comes no later. A client whose response-header timeout is under 60 seconds could time out while a response is held. Such a client should raise that timeout.
 - A request can use up to one attempt per account, as before (`failover-bounded-by-accounts`). Each discarded attempt costs upstream work but produces no output tokens.
 - Stats now record these failures as `overloaded`. Rows recorded before this change keep `error_code = "error"`.
+
+## Implementation correction, 2026-11-02
+
+A live Responses request returned valid SSE under `Content-Type: application/json`.
+The usage parser already treated an explicit `stream: true` request as streaming,
+but the proxy forwarded the incorrect header, causing a downstream client to
+reject the completed response as invalid JSON. Successful responses now publish
+`text/event-stream` whenever the existing request/header classifier selects
+streaming. Both live forwarding and held overload replay share this correction;
+non-stream JSON and HTTP errors retain their media type. Body bytes, request
+identity, bounded failover and retry-certificate requirements are unchanged.
+
+The HTTP integration regression exercises success and certified overload replay
+with missing or incorrect upstream media types, plus ordinary JSON and HTTP
+errors. In the pinned devenv shell on 2026-11-02, `cargo test --locked` passed all
+183 tests (134 library, 2 binary, 1 correlation integration, 15 HTTP integration
+and 31 property tests), including this regression. `cargo fmt --check`,
+`cargo check --offline` and `cargo build --locked --release` also passed. Contract
+syntax checks and semantic review confirmed that the existing pre-output failover,
+backend independence and retry-certificate obligations remain unchanged.
