@@ -3,6 +3,12 @@
 version = 4
 
 [[package]]
+name = "adler2"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -491,6 +497,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashu-base"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "861a614e79388a4c72aa66b0bdabc91e3a4f30d53e0c8d962953e207d75884d0"
+dependencies = [
+ "num-modular",
+]
+
+[[package]]
+name = "dashu-int"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64a0490b40a6a3f6427970035f17f76fd59c01d3cd9f9140809672863a0d64c8"
+dependencies = [
+ "cfg-if",
+ "dashu-base",
+ "num-modular",
+ "static_assertions",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -810,19 +837,38 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hegeltest"
-version = "0.49.6"
+version = "0.54.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b3bc288b6b1f04e479d46ee1d51deddd70c226b9d65ff99a390b6daebbd9d0d"
+checksum = "acee0de6dcbbd721a0b4a351370aa9d16b2bfadd2b3423b6a839d3c7af5a9cde"
 dependencies = [
+ "hegeltest-c",
  "hegeltest-macros",
  "parking_lot",
 ]
 
 [[package]]
-name = "hegeltest-macros"
-version = "0.49.6"
+name = "hegeltest-c"
+version = "0.53.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e088d82b24120d043e5b8ef9f99d6e3ee9a8fc1df5a39842576809b82287665f"
+checksum = "c2507f682e2d497b9d9a375374ee6f541cb8178a45e39c38b3f991bfd4dcbcd3"
+dependencies = [
+ "dashu-int",
+ "hashbrown 0.17.1",
+ "libm",
+ "miniz_oxide",
+ "once_cell",
+ "rand",
+ "rustc-hash",
+ "rustix",
+ "toml",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hegeltest-macros"
+version = "0.54.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2da53a47c5682be01710f27e1e1fdc3fe0cc12ea3711bffb8fc763c7245f8e45"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1339,6 +1385,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "miniz_oxide"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+dependencies = [
+ "adler2",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1391,6 +1446,12 @@ name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
+
+[[package]]
+name = "num-modular"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd8e500409e6cd603b03e477c26a6caecdc27ac58979a53e881c75eafc079f44"
 
 [[package]]
 name = "num-traits"
